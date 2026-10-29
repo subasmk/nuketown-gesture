@@ -33,3 +33,12 @@ Local expo launcher does not configure accounts, purchases, cloud store or publi
 `node test-gestures.cjs` tests neutral/deadzone/loss handling. `node test-gesture-bridge.cjs` tests native intent, fire release, pause/stale stop and safe neutral behavior. `npm test` runs upstream tests. The pre-change upstream suite had 379/380 passing here, one failing store animation assertion ('a character stopped turning'). Do not mistake that existing failure for a clean all-tests pass. The local variant's script-security assertion accepts the three npm-pinned same-origin dependencies instead of demanding CDN copies. The original store-animation check passed on the later run, so it may be order/timing-sensitive. Default upstream check/build freshness expectations refer to their Bash builder; use npm run build for this local variant.
 
 Syntax, model/library routes, local HTTPS and browser render were checked. Physical Windows camera directions/model speed, pointer lock and TWO actual laptop cameras over hotspot remain unverified. This is a prototype, not a claim of expo readiness. Test neutral, stop-on-hand-loss, pinch release, movement and guest play on both machines before presenting it.
+
+
+## Two options: bots or first-kill 1v1
+- SOLO: unchanged practice against eight bots.
+- First-kill 1v1: both laptops open the host HTTPS URL, enter distinct PLAYER NAME values. Host opens ROOMS, selects **1v1 ROOM - FIRST KILL WINS**. This is an unlisted, two-seat room with zero bots. Friend uses ROOMS -> code -> JOIN (or the invite link). Host waits for exactly two names, clicks START MATCH, then both click ENTER MATCH. Calibrate gestures on each laptop before entering. First valid elimination ends the round, displays the winner's name on both screens, and stops gameplay. No timed auto-rematch in this mode.
+- Same pair: host clicks NEXT ROUND / SAME PAIR, then both ENTER MATCH. Health, ammo, scores reset.
+- Next booth pair: both click MAIN MENU, change PLAYER NAME values, host creates a new 1v1 room, friend joins the new code. This avoids carrying previous people's names or scores.
+- Disconnect during a live duel cancels it with no winner; return to menu and create a new room. A third player is rejected. A running duel cannot accept a substitute.
+- CREATE DEATHMATCH ROOM and regular PLAY retain their original bot-fill/25-kill behavior. The 1v1 rule is carried by the room, not the URL or the guest's selected mode.
