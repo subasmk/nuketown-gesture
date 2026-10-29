@@ -43,3 +43,23 @@ test('unrelated websocket paths are still refused', async (t) => {
     ws.once('error', reject);
   }));
 });
+
+test('gyro relay forwards phone jump messages to the game page', async (t) => {
+  const port = await startRelay(t);
+  const game = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=game`);
+  await new Promise((resolve) => game.once('open', resolve));
+  const phone = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=phone`);
+  await new Promise((resolve) => phone.once('open', resolve));
+  const received = new Promise((resolve) => game.once('message', (data) => resolve(data.toString())));
+  phone.send(JSON.stringify({ t: 'jump', on: true }));
+  assert.deepEqual(JSON.parse(await received), { t: 'jump', on: true });
+  game.close();
+  phone.close();
+});
+
+test('game wiring: phone jump feeds the local input and the Windows build includes phone-gyro.js', async () => {
+  const fs = await import('node:fs');
+  assert.match(fs.readFileSync('src/70-game.js', 'utf8'), /PHONE_JUMP/);
+  assert.match(fs.readFileSync('phone-gyro.js', 'utf8'), /t === 'jump'/);
+  assert.match(fs.readFileSync('build-windows.mjs', 'utf8'), /phone-gyro\.js/);
+});

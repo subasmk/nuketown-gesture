@@ -2,10 +2,11 @@
    /controller on this same laptop server and streams orientation deltas over
    a WebSocket on /gyro. While a phone is live it owns aim + fire and the
    webcam hand drives walking only; nothing leaves the hotspot. */
-const PHONE = { enabled: false, ws: null, liveUntil: 0, last: 0, lookX: 0, lookY: 0, fire: false, holding: false };
+const PHONE = { enabled: false, ws: null, liveUntil: 0, last: 0, lookX: 0, lookY: 0, fire: false, jump: false, holding: false };
+function PHONE_JUMP() { return PHONE_LIVE() && PHONE.jump; }
 /* The gesture bridge asks this before applying webcam aim/fire. */
 function PHONE_LIVE() { return PHONE.enabled && PHONE.ws && PHONE.ws.readyState === 1 && performance.now() < PHONE.liveUntil; }
-function phoneRelease() { if (PHONE.holding) { PHONE.holding = false; releaseFire(); } PHONE.fire = false; }
+function phoneRelease() { if (PHONE.holding) { PHONE.holding = false; releaseFire(); } PHONE.fire = false; PHONE.jump = false; }
 function phoneStatus(t) { const el = document.getElementById?.('phone-status'); if (el) el.textContent = t; }
 function phoneTick(dt) {
   const ok = PHONE.enabled && document.hasFocus() && !document.hidden && G.started && !G.paused && !G.over && G.player && G.player.alive;
@@ -34,7 +35,8 @@ function phoneConnect() {
         PHONE.lookX = Math.max(-500, Math.min(500, PHONE.lookX + (+m.dx || 0)));
         PHONE.lookY = Math.max(-500, Math.min(500, PHONE.lookY + (+m.dy || 0)));
       } else if (m.t === 'fire') PHONE.fire = !!m.on;
-      phoneStatus(PHONE.fire ? 'Phone live — FIRING' : 'Phone live — tilt aims, FIRE button shoots. Webcam hand = walking.');
+      else if (m.t === 'jump') PHONE.jump = !!m.on;
+      phoneStatus(PHONE.fire ? 'Phone live — FIRING' : 'Phone live — tilt aims, Vol UP shoots, Vol DOWN jumps. Webcam hand = walking.');
     } catch {}
   };
   ws.onclose = () => { if (PHONE.ws === ws) { PHONE.ws = null; phoneRelease(); phoneStatus('Phone disconnected. Tap CONNECT PHONE to retry.'); } };
@@ -43,7 +45,7 @@ function phoneConnect() {
 addEventListener('DOMContentLoaded', () => {
   const box = document.createElement('section'); box.id = 'phone-panel';
   box.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:100000;width:230px;padding:8px;background:#182431ed;color:white;font:12px system-ui;border-radius:10px';
-  box.innerHTML = '<b>PHONE AIM</b><br><div id="phone-status" role="status">Off. Tap CONNECT PHONE, then open the link on the phone.</div><button id="phone-connect">CONNECT PHONE</button><br><span id="phone-link"></span><br>Phone tilt = screen turn | phone FIRE = shoot<br>While live, webcam hand = WALKING only';
+  box.innerHTML = '<b>PHONE AIM</b><br><div id="phone-status" role="status">Off. Tap CONNECT PHONE, then open the link on the phone.</div><button id="phone-connect">CONNECT PHONE</button><br><span id="phone-link"></span><br>Phone tilt = screen turn | phone Vol UP = shoot | Vol DOWN = jump<br>While live, webcam hand = WALKING only';
   document.body.append(box);
   const link = document.getElementById('phone-link');
   try { link.textContent = location.origin + '/controller'; } catch {}

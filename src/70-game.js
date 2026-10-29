@@ -755,7 +755,7 @@ function readLocalInput(accepts) {
   return {
     fwd: kFwd || TOUCH.fwd || (typeof GESTURE!=='undefined'&&gestureAccepts()?GESTURE.fwd:0),
     strafe: kStrafe || TOUCH.strafe || (typeof GESTURE!=='undefined'&&gestureAccepts()?GESTURE.strafe:0),
-    jump: !!KEY.Space || TOUCH.jump,
+    jump: !!KEY.Space || TOUCH.jump || (typeof PHONE_JUMP!=='undefined'&&PHONE_JUMP()),
     sprint: !!KEY.ShiftLeft || !!KEY.ShiftRight || TOUCH.sprint,
     fire: !!IN.firing
   };

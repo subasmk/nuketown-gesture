@@ -49,3 +49,5 @@ Syntax, model/library routes, local HTTPS and browser render were checked. Physi
 - Next booth pair: both click MAIN MENU, change PLAYER NAME values, host creates a new 1v1 room, friend joins the new code. This avoids carrying previous people's names or scores.
 - Disconnect during a live duel cancels it with no winner; return to menu and create a new room. A third player is rejected. A running duel cannot accept a substitute.
 - CREATE DEATHMATCH ROOM and regular PLAY retain their original bot-fill/25-kill behavior. The 1v1 rule is carried by the room, not the URL or the guest's selected mode.
+
+8. **Android app (volume keys):** install `android-controller` (see its README). Volume UP = fire, Volume DOWN = jump, phone turn = aim. Use it instead of the browser /controller page; the page still works as a fallback with an on-screen FIRE button.
