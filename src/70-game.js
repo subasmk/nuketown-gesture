@@ -752,8 +752,8 @@ function readLocalInput(accepts) {
   const kFwd = (KEY.KeyW ? 1 : 0) - (KEY.KeyS ? 1 : 0);
   const kStrafe = (KEY.KeyD ? 1 : 0) - (KEY.KeyA ? 1 : 0);
   return {
-    fwd: kFwd || TOUCH.fwd,
-    strafe: kStrafe || TOUCH.strafe,
+    fwd: kFwd || TOUCH.fwd || (typeof GESTURE!=='undefined'&&gestureAccepts()?GESTURE.fwd:0),
+    strafe: kStrafe || TOUCH.strafe || (typeof GESTURE!=='undefined'&&gestureAccepts()?GESTURE.strafe:0),
     jump: !!KEY.Space || TOUCH.jump,
     sprint: !!KEY.ShiftLeft || !!KEY.ShiftRight || TOUCH.sprint,
     fire: !!IN.firing
@@ -813,7 +813,7 @@ function initInput() {
     if (e.code === 'Tab') setBoard(false);
   });
   addEventListener('mousedown', e => {
-    if (IN.locked && e.button === 0) { pressFire(); return; }
+    if (IN.locked && e.button === 0) { if(typeof GESTURE!=='undefined')GESTURE.mouse=true;pressFire(); return; }
     /* Clicking back into the window re-takes the lock, the way every other
        shooter does it. Without it, resuming with Escape would be a trap of
        its own: Chrome refuses a lock request for about a second after an
@@ -823,7 +823,7 @@ function initInput() {
        pause card or the buttons on it. */
     if (e.button === 0 && G.started && !G.paused && !G.over && !TOUCH.on) requestLock();
   });
-  addEventListener('mouseup', e => { if (e.button === 0) releaseFire(); });
+  addEventListener('mouseup', e => { if (e.button === 0) { if(typeof GESTURE!=='undefined')GESTURE.mouse=false;releaseFire(); } });
   addEventListener('wheel', e => {
     if (!IN.locked) return;
     const order = ['smg', 'shotgun', 'rifle'];
