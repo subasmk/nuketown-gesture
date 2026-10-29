@@ -545,6 +545,7 @@ export function createRelayServer(options = {}) {
       id: peer.id,
       name: peer.name,
       room: peer.room.code,
+      ...(peer.room.rules === 'duel' ? { rules: 'duel' } : {}),
       role: peer.role,
       slot: peer.slot,
       signedIn: !!peer.userId,
@@ -868,7 +869,7 @@ export function createRelayServer(options = {}) {
      the impatient. */
 
   function autoStartEligible(room) {
-    return autoStartMs > 0 && !room.started && !room.migrating &&
+    return room.rules !== 'duel' && autoStartMs > 0 && !room.started && !room.migrating &&
       !!room.host && room.members.size >= 2;
   }
 
@@ -992,6 +993,7 @@ export function createRelayServer(options = {}) {
       v: Protocol.VERSION,
       authorityEpoch: room.authorityEpoch,
       round: room.round,
+      ...(room.rules === 'duel' ? { rules: 'duel' } : {}),
       map: room.map,
       members: memberList(room)
     }, true);
@@ -1098,6 +1100,7 @@ export function createRelayServer(options = {}) {
       t: 'room',
       v: Protocol.VERSION,
       room: peer.room.code,
+      ...(peer.room.rules === 'duel' ? { rules: 'duel' } : {}),
       id: peer.id,
       role: peer.role,
       authorityEpoch: peer.room.authorityEpoch,
@@ -1139,6 +1142,7 @@ export function createRelayServer(options = {}) {
 
     const room = {
       code,
+      rules: message.rules === 'duel' ? 'duel' : 'standard',
       map,
       host: null,
       members: new Map(),
@@ -1161,7 +1165,7 @@ export function createRelayServer(options = {}) {
       autoStartHolds: 0,
       /* Listed by default so the room browser is useful out of the box;
          a host that wants the old code-only privacy sends listed:false. */
-      listed: message.listed !== false
+      listed: message.rules !== 'duel' && message.listed !== false
     };
     rooms.set(code, room);
     enterRoom(peer, room, 'host', name, identity, supportedMaps);
@@ -1203,7 +1207,11 @@ export function createRelayServer(options = {}) {
       sendError(peer, 'room-migrating', 'That room is changing host. Try again in a moment.');
       return;
     }
-    if (room.members.size >= Protocol.MAX_PLAYERS) {
+    if (room.rules === 'duel' && room.started) {
+      sendError(peer, 'room-full', 'This 1v1 round is running. Wait for the next pair.');
+      return;
+    }
+    if (room.members.size >= (room.rules === 'duel' ? 2 : Protocol.MAX_PLAYERS)) {
       sendError(peer, 'room-full', 'That room is full.');
       return;
     }
@@ -1692,6 +1700,10 @@ export function createRelayServer(options = {}) {
       if (!hasCurrentAuthority(peer, message)) return;
       if (peer.room.started) {
         sendError(peer, 'already-started', 'The match is already running.');
+        return;
+      }
+      if (peer.room.rules === 'duel' && peer.room.members.size !== 2) {
+        sendError(peer, 'need-two', '1v1 requires exactly two players.');
         return;
       }
       startRound(peer.room);
