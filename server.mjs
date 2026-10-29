@@ -23,6 +23,7 @@ import Protocol from './net-protocol.js';
 const ROOT_DIR = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_INDEX_PATH = resolve(ROOT_DIR, 'index.html');
 const DEFAULT_PROTOCOL_PATH = resolve(ROOT_DIR, 'net-protocol.js');
+const DEFAULT_CONTROLLER_PATH = resolve(ROOT_DIR, 'phone-controller.html');
 
 const RELAY_TYPES = new Set(['snapshot', 'checkpoint', 'event']);
 const CHECKPOINT_CONTROLLERS = new Set(['local', 'remote', 'bot']);
@@ -100,6 +101,7 @@ export function createRelayServer(options = {}) {
   const relayNow = typeof options.now === 'function' ? options.now : Date.now;
   const indexPath = options.indexPath || DEFAULT_INDEX_PATH;
   const protocolPath = options.protocolPath || DEFAULT_PROTOCOL_PATH;
+  const controllerPath = options.controllerPath || DEFAULT_CONTROLLER_PATH;
   const maxMessageBytes = positiveInteger(
     options.maxMessageBytes,
     Protocol.MAX_MESSAGE_BYTES
@@ -752,6 +754,11 @@ export function createRelayServer(options = {}) {
     if (pathname === '/' || pathname === '/index.html') {
       filePath = indexPath;
       contentType = 'text/html; charset=utf-8';
+    } else if (pathname === '/controller') {
+      /* Phone gyro controller page: same laptop server, same LAN trust as
+         the game page itself. */
+      filePath = controllerPath;
+      contentType = 'text/html; charset=utf-8';
     } else if (pathname === '/net-protocol.js') {
       filePath = protocolPath;
       contentType = 'text/javascript; charset=utf-8';
@@ -793,6 +800,37 @@ export function createRelayServer(options = {}) {
     maxPayload: maxMessageBytes,
     noServer: true,
     perMessageDeflate: false
+  });
+
+  /* Phone gyro controller relay: one game page (role=game) and one phone
+     (role=phone) per server. Phone messages forward to the game verbatim;
+     the game page validates shape. Local LAN only, tiny payloads, no rooms,
+     no state -- a newest-connection-wins pipe. */
+  const gyroWss = new WebSocketServer({
+    clientTracking: false,
+    maxPayload: 4096,
+    noServer: true,
+    perMessageDeflate: false
+  });
+  let gyroGame = null;
+  let gyroPhone = null;
+  gyroWss.on('connection', (ws, request) => {
+    let role;
+    try { role = new URL(request.url || '', 'http://localhost').searchParams.get('role'); }
+    catch { role = null; }
+    const isGame = role === 'game';
+    const prev = isGame ? gyroGame : gyroPhone;
+    if (prev && prev !== ws && prev.readyState === WebSocket.OPEN) prev.terminate();
+    if (isGame) gyroGame = ws; else gyroPhone = ws;
+    ws.on('message', (data) => {
+      const target = isGame ? gyroPhone : gyroGame;
+      if (target && target.readyState === WebSocket.OPEN) target.send(data.toString());
+    });
+    ws.on('close', () => {
+      if (isGame && gyroGame === ws) gyroGame = null;
+      if (!isGame && gyroPhone === ws) gyroPhone = null;
+    });
+    ws.on('error', () => {});
   });
 
   function sendEncoded(peer, encoded, isSnapshot = false) {
@@ -2248,6 +2286,16 @@ export function createRelayServer(options = {}) {
       return;
     }
 
+    if (pathname === '/gyro') {
+      if (!originAllowed(request)) {
+        socket.destroy();
+        return;
+      }
+      gyroWss.handleUpgrade(request, socket, head, (ws) => {
+        gyroWss.emit('connection', ws, request);
+      });
+      return;
+    }
     if (pathname !== '/ws') {
       socket.destroy();
       return;
@@ -2332,6 +2380,8 @@ export function createRelayServer(options = {}) {
       if (room.migrating && room.migrating.timer) clearTimeout(room.migrating.timer);
     }
     for (const peer of peers.values()) peer.ws.terminate();
+    for (const ws of [gyroGame, gyroPhone]) if (ws) ws.terminate();
+    gyroWss.close();
 
     if (server.listening) {
       await new Promise((resolveClose, rejectClose) => {

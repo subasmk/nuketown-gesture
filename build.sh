@@ -80,6 +80,14 @@ trap 'rm -f "$TMP"' EXIT
     echo '</script>'
   done
 
+  # Expo additions: webcam gestures + phone gyro controller. Inlined like
+  # everything else, so the relay still serves one self-contained entry.
+  for f in gesture-controller.js gesture-bridge.js phone-gyro.js; do
+    echo "<script>/* $f */"
+    cat "$f"
+    echo '</script>'
+  done
+
   echo '</body>'
   echo '</html>'
 } > "$TMP"

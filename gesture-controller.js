@@ -10,6 +10,10 @@
 //   * Losing one hand only parks that hand's channel after a short
 //     grace period; the other hand keeps working. Nothing waits on
 //     window focus — only a hidden tab pauses input.
+// v3 — easier on first-time players:
+//   * heavier aim smoothing + wider deadzone (less jitter/overshoot),
+//   * pinch fires on a light touch and releases on a clear open,
+//   * neutrals settle faster, and the status line shows FIRING live.
 window.GestureControl = (() => {
   let running = false, starting = false, fatal = false;
   let cameraState = 'not started', detail = 'Click ENABLE CAMERA to start';
@@ -27,7 +31,7 @@ window.GestureControl = (() => {
   }
   const center = p => [0, 5, 9, 13, 17].reduce((a, i) => ({ x: a.x + p[i].x / 5, y: a.y + p[i].y / 5 }), { x: 0, y: 0 });
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-  const axis = (v, span) => Math.abs(v) < .04 ? 0 : Math.max(-1, Math.min(1, (v - Math.sign(v) * .04) / span));
+  const axis = (v, span) => Math.abs(v) < .05 ? 0 : Math.max(-1, Math.min(1, (v - Math.sign(v) * .05) / span));
 
   function emit() {
     handlers?.onAim(aim.x, aim.y);
@@ -48,7 +52,7 @@ window.GestureControl = (() => {
     if (!r.neutral) {
       if (!r.cand || Math.hypot(pos.x - r.cand.x, pos.y - r.cand.y) > .06) { r.cand = { ...pos }; r.candN = 1; }
       else { r.candN++; r.cand.x += (pos.x - r.cand.x) / r.candN; r.cand.y += (pos.y - r.cand.y) / r.candN; }
-      if (r.candN >= 5) { r.neutral = { ...r.cand }; r.cand = null; r.candN = 0; }
+      if (r.candN >= 4) { r.neutral = { ...r.cand }; r.cand = null; r.candN = 0; }
       return false;
     }
     return true;
@@ -91,14 +95,14 @@ window.GestureControl = (() => {
     const tip = { x: aimHand[8].x, y: aimHand[8].y };
     if (feedRole('aim', tip, now)) {
       const n = roles.aim.neutral;
-      aim.x += .35 * (axis(tip.x - n.x, .20) - aim.x);
-      aim.y += .35 * (axis(tip.y - n.y, .20) - aim.y);
-      if (Math.abs(tip.x - n.x) < .04) aim.x = 0;
-      if (Math.abs(tip.y - n.y) < .04) aim.y = 0;
+      aim.x += .22 * (axis(tip.x - n.x, .24) - aim.x);
+      aim.y += .22 * (axis(tip.y - n.y, .24) - aim.y);
+      if (Math.abs(tip.x - n.x) < .05) aim.x = 0;
+      if (Math.abs(tip.y - n.y) < .05) aim.y = 0;
       // Pinch = held trigger with hysteresis.
       const scale = Math.max(.03, dist(aimHand[0], aimHand[9]));
       const pinch = dist(aimHand[4], aimHand[8]) / scale;
-      const want = pinchState ? pinch < .50 : pinch < .34;
+      const want = pinchState ? pinch < .62 : pinch < .42;
       if (want !== pinchState) {
         if (!pinchSince) pinchSince = now;
         if (now - pinchSince > 50) { pinchState = want; pinchSince = 0; }
@@ -110,20 +114,21 @@ window.GestureControl = (() => {
       const mc = center(all[moveIdx]);
       if (feedRole('move', mc, now)) {
         const n = roles.move.neutral;
-        move.x += .4 * (axis(mc.x - n.x, .17) - move.x);
+        move.x += .3 * (axis(mc.x - n.x, .20) - move.x);
         // Image y grows downward; the game reads +fwd as forward (the
         // touch stick does the same inversion: up on screen = forward).
-        move.z += .4 * (axis(n.y - mc.y, .17) - move.z);
-        if (Math.abs(mc.x - n.x) < .04) move.x = 0;
-        if (Math.abs(mc.y - n.y) < .04) move.z = 0;
+        move.z += .3 * (axis(n.y - mc.y, .20) - move.z);
+        if (Math.abs(mc.x - n.x) < .05) move.x = 0;
+        if (Math.abs(mc.y - n.y) < .05) move.z = 0;
       } else move = { x: 0, z: 0 };
     } else if (now - roles.move.lastSeenAt > 200) zeroRole('move');
 
     emit();
+    const tag = firing ? 'FIRING! ' : '';
     if (!roles.aim.neutral) report('Hold aim hand steady — setting its neutral…');
-    else if (detected === 1) report('1 hand: AIM + pinch = FIRE. Show 2nd hand to MOVE.');
-    else if (!roles.move.neutral) report('Aim live. Hold 2nd hand steady — setting move neutral…');
-    else report(`2 hands: AIM + pinch FIRE | MOVE ${move.z > 0 ? 'FORWARD' : move.z < 0 ? 'BACK' : ''}${move.x > 0 ? ' RIGHT' : move.x < 0 ? ' LEFT' : ''} | C re-centre`);
+    else if (detected === 1) report(`${tag}1 hand: AIM + light pinch = FIRE. Show 2nd hand to MOVE.`);
+    else if (!roles.move.neutral) report(`${tag}Aim live. Hold 2nd hand steady — setting move neutral…`);
+    else report(`${tag}2 hands: AIM + pinch FIRE | MOVE ${move.z > 0 ? 'FORWARD' : move.z < 0 ? 'BACK' : ''}${move.x > 0 ? ' RIGHT' : move.x < 0 ? ' LEFT' : ''} | C re-centre`);
   }
 
   function start(videoEl, h) {

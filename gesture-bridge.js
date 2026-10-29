@@ -5,13 +5,18 @@ function gestureAccepts(){return GESTURE.enabled && document.hasFocus()&&!docume
 function gestureTick(dt){
   const panel=document.getElementById?.('gesture-panel');if(panel){panel.style.top=G.started?'85px':'auto';panel.style.bottom=G.started?'auto':'8px';}
   if(!gestureAccepts()||performance.now()-GESTURE.last>400){gestureStop();return;}
-  applyLook(GESTURE.ax*700*Math.min(dt,.05),GESTURE.ay*550*Math.min(dt,.05),mouseSens);
-  if(GESTURE.fire&&!IN.firing)pressFire();
-  if(!GESTURE.fire&&!GESTURE.mouse&&IN.firing)releaseFire();
+  /* A live phone owns aim + fire; the webcam hand then drives walking
+     only, so gesture look and pinch must not fight the phone. */
+  const phoneAim=typeof PHONE_LIVE!=='undefined'&&PHONE_LIVE();
+  if(!phoneAim){
+    applyLook(GESTURE.ax*600*Math.min(dt,.05),GESTURE.ay*460*Math.min(dt,.05),mouseSens);
+    if(GESTURE.fire&&!IN.firing)pressFire();
+    if(!GESTURE.fire&&!GESTURE.mouse&&IN.firing)releaseFire();
+  }
 }
 addEventListener('DOMContentLoaded',()=>{
  const box=document.createElement('section');box.id='gesture-panel';box.style.cssText='position:fixed;left:8px;bottom:8px;z-index:100000;width:230px;padding:8px;background:#182431ed;color:white;font:12px system-ui;border-radius:10px';
- box.innerHTML='<b>GESTURE CONTROL</b><br><details><summary>Camera preview (expand)</summary><video id="gesture-video" autoplay muted playsinline style="width:100%;max-height:130px;transform:scaleX(-1)"></video></details><div id="gesture-note" role="status">Camera off. Click ENABLE CAMERA.</div><button id="gesture-start">ENABLE CAMERA</button> <button id="gesture-neutral">SET NEUTRAL</button><br>C recenter | F8 pause gestures<br>One hand: fingertip aims, pinch = fire<br>Second hand: palm moves (raise = forward)<br>R reload | Space jump | 1/2/3 weapons';document.body.append(box);
+ box.innerHTML='<b>GESTURE CONTROL</b><br><details><summary>Camera preview (expand)</summary><video id="gesture-video" autoplay muted playsinline style="width:100%;max-height:130px;transform:scaleX(-1)"></video></details><div id="gesture-note" role="status">Camera off. Click ENABLE CAMERA.</div><button id="gesture-start">ENABLE CAMERA</button> <button id="gesture-neutral">SET NEUTRAL</button><br>C recenter | F8 pause gestures<br>One hand: fingertip aims, light pinch = FIRE (hold to keep firing)<br>Second hand: palm moves (raise = forward)<br>R reload | Space jump | 1/2/3 weapons';document.body.append(box);
  const note=document.getElementById('gesture-note');
  document.getElementById('gesture-start').onclick=()=>{
   GESTURE.enabled=true;

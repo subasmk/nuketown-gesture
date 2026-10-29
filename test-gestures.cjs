@@ -102,6 +102,16 @@ function frames(n, make) { for (let i = 0; i < n; i++) { clock += 30; frame(...m
   assert.strictEqual(fire, false);
   console.log('PASS watchdog zeros input when tracking stalls');
 
+  // 9b. A light, partial pinch still fires (forgiving threshold), and the
+  // trigger holds through small finger wobble around the old cutoff.
+  frames(4, () => [[AIM(0.05, -0.05, 0.38)]]);
+  assert.strictEqual(fire, true);
+  frames(2, () => [[AIM(0.05, -0.05, 0.55)]]);
+  assert.strictEqual(fire, true);
+  frames(3, () => [[AIM(0.05, -0.05, 0.9)]]);
+  assert.strictEqual(fire, false);
+  console.log('PASS light pinch fires and holds through wobble');
+
   // 9. Recalibrate re-settles at the current pose.
   context.window.GestureControl.calibrate();
   frames(6, () => [[AIM(0.05, -0.05)]]);

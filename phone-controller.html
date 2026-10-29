@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Nuketown phone controller</title>
+<style>
+ body{margin:0;background:#101820;color:#fff;font:16px system-ui;height:100dvh;display:flex;flex-direction:column;user-select:none;-webkit-user-select:none;touch-action:manipulation;overscroll-behavior:none}
+ #top{padding:14px;text-align:center}
+ #status{font-size:14px;opacity:.85;min-height:42px;margin-top:6px}
+ button{font:700 18px system-ui;border:0;border-radius:12px;padding:14px 22px;margin:6px;background:#2e6da4;color:#fff}
+ button:disabled{opacity:.35}
+ #fire{flex:1;margin:12px;background:#c0392b;font-size:34px;border-radius:22px}
+ #fire.on{background:#e74c3c}
+</style>
+</head>
+<body>
+<div id="top">
+ <b>PHONE CONTROLLER</b>
+ <div id="status">Tap START and allow motion access. Tilt the phone to turn the game screen.</div>
+ <button id="start">START</button>
+ <button id="centre" disabled>RE-CENTRE</button>
+</div>
+<button id="fire" disabled>FIRE</button>
+<script>
+// Local LAN phone controller for the expo build: streams phone tilt to the
+// laptop over /gyro. Nothing leaves the hotspot. Hardware volume keys are
+// not readable from a web page in Chrome, so the big FIRE button below is
+// the trigger (volume up works only on the few browsers that expose it as
+// a key event -- handled at the bottom as a bonus).
+const $=id=>document.getElementById(id);
+let ws=null,last=null,accX=0,accY=0,firing=false,sendTimer=0;
+const SENS=9; /* mouse-like units per degree of phone tilt */
+function say(t){$('status').textContent=t;}
+function connect(){
+  const proto=location.protocol==='https:'?'wss':'ws';
+  ws=new WebSocket(proto+'://'+location.host+'/gyro?role=phone');
+  ws.onopen=()=>say('Connected. Tilt phone = turn screen. Hold FIRE to shoot.');
+  ws.onclose=()=>{say('Disconnected. Tap START to reconnect.');ws=null;fireOff();};
+  ws.onerror=()=>{};
+}
+function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
+function onOrient(e){
+  if(e.alpha==null)return;
+  const cur={a:e.alpha,b:e.beta||0};
+  if(!last){last=cur;return;}
+  let da=cur.a-last.a;if(da>180)da-=360;if(da<-180)da+=360;
+  let db=cur.b-last.b;
+  last=cur;
+  if(Math.abs(da)>25||Math.abs(db)>25)return; /* sensor glitch/wrap spike */
+  accX+=da*SENS;accY+=db*SENS;
+}
+function startAll(){
+  if(!ws||ws.readyState>1)connect();
+  const go=()=>{
+    addEventListener('deviceorientation',onOrient);
+    $('centre').disabled=false;$('fire').disabled=false;$('start').textContent='RECONNECT';
+    if(!sendTimer)sendTimer=setInterval(()=>{
+      if(accX||accY){send({t:'look',dx:Math.round(accX*10)/10,dy:Math.round(accY*10)/10});accX=accY=0;}
+    },50);
+    say('Starting... keep the phone steady for a moment.');
+  };
+  if(typeof DeviceOrientationEvent!=='undefined'&&typeof DeviceOrientationEvent.requestPermission==='function'){
+    DeviceOrientationEvent.requestPermission().then(r=>{if(r==='granted')go();else say('Motion permission denied.');}).catch(()=>say('Motion permission failed.'));
+  }else go();
+}
+$('start').onclick=startAll;
+$('centre').onclick=()=>{last=null;accX=accY=0;say('Re-centred. Hold the phone where you want straight ahead.');};
+function fireOn(e){if(e)e.preventDefault();if(firing)return;firing=true;$('fire').classList.add('on');send({t:'fire',on:true});}
+function fireOff(e){if(e&&e.cancelable)e.preventDefault();if(!firing)return;firing=false;$('fire').classList.remove('on');send({t:'fire',on:false});}
+$('fire').addEventListener('touchstart',fireOn,{passive:false});
+$('fire').addEventListener('touchend',fireOff);
+$('fire').addEventListener('touchcancel',fireOff);
+$('fire').addEventListener('mousedown',fireOn);
+addEventListener('mouseup',fireOff);
+addEventListener('keydown',e=>{
+  if(e.key==='AudioVolumeUp'||e.code==='AudioVolumeUp'||e.key==='VolumeUp'){
+    fireOn(e);setTimeout(()=>fireOff(),200);
+  }
+});
+document.addEventListener('gesturestart',e=>e.preventDefault());
+</script>
+</body>
+</html>
