@@ -2,13 +2,12 @@ package com.subasmk.nuketown;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
+import android.os.Build;
+import android.widget.CheckBox;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
-import android.hardware.Sensor;
-import android.hardware.SensorEvent;
-import android.hardware.SensorEventListener;
-import android.hardware.SensorManager;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
@@ -26,8 +25,6 @@ import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
 /**
  * Nuketown phone controller (native). Replaces the browser /controller page so
@@ -36,45 +33,30 @@ import java.util.concurrent.Executors;
  *   Volume DOWN = jump
  *   Phone turn/tilt = aim (same /gyro WebSocket and messages as the web page)
  */
-public class MainActivity extends Activity implements SensorEventListener {
+public class MainActivity extends Activity {
     private static final String PREFS = "nuketown";
-    private final ExecutorService net = Executors.newSingleThreadExecutor();
     private final Handler ui = new Handler(Looper.getMainLooper());
 
     private EditText urlBox;
     private TextView status;
-    private Button connectBtn, centreBtn;
+    private Button connectBtn, centreBtn, modeBtn;
     private SeekBar sensBar;
     private TextView sensLabel;
-
-    private SensorManager sm;
-    private Sensor rot;
-    private MiniWebSocket ws;
-
-    private boolean haveLast;
-    private float lastAz, lastPitch;
-    private float accX, accY;
-    private float sens = 13f; // game units per degree of phone turn (8.3 is 1:1)
+    private float sens = 13f;
+    private int mode = ControllerService.MODE_POINT;
     private boolean fireOn, jumpOn;
-    private final float[] R = new float[9], R2 = new float[9], O = new float[3];
 
-    private final Runnable flush = new Runnable() {
-        @Override public void run() {
-            if (ws != null && ws.isOpen() && (accX != 0 || accY != 0)) {
-                final String m = "{\"t\":\"look\",\"dx\":" + Math.round(accX * 10) / 10.0
-                    + ",\"dy\":" + Math.round(accY * 10) / 10.0 + "}";
-                accX = accY = 0;
-                send(m);
-            } else if (ws == null || !ws.isOpen()) { accX = accY = 0; }
-            ui.postDelayed(this, 40);
-        }
+    private final Runnable refresh = () -> {
+        status.setText(ControllerService.status);
+        connectBtn.setText(ControllerService.inst != null ? "DISCONNECT" : "CONNECT");
     };
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
         sens = sp.getFloat("sens", 13f);
+        mode = sp.getInt("mode", ControllerService.MODE_POINT);
+        if (Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -105,8 +87,23 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         centreBtn = new Button(this);
         centreBtn.setText("RE-CENTRE (hold phone straight at the screen, tap)");
-        centreBtn.setOnClickListener(v -> { haveLast = false; accX = accY = 0; say("Re-centred."); });
+        centreBtn.setOnClickListener(v -> {
+            ControllerService c = ControllerService.inst;
+            if (c != null) c.centre();
+            say("Re-centred. This direction is now straight ahead.");
+        });
         root.addView(centreBtn);
+
+        modeBtn = new Button(this);
+        modeBtn.setOnClickListener(v -> {
+            mode = mode == ControllerService.MODE_POINT ? ControllerService.MODE_TILT : ControllerService.MODE_POINT;
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt("mode", mode).apply();
+            ControllerService c = ControllerService.inst;
+            if (c != null) c.setMode(mode);
+            modeText();
+        });
+        root.addView(modeBtn);
+        modeText();
 
         sensLabel = text("", 14, false);
         root.addView(sensLabel);
@@ -114,7 +111,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         sensBar.setMax(30);
         sensBar.setProgress(Math.round(sens) - 4);
         sensBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onProgressChanged(SeekBar s, int p, boolean u) { sens = p + 4; sensLabel.setText("Aim sensitivity: " + (int) sens + " (higher = turns faster)"); }
+            @Override public void onProgressChanged(SeekBar s, int p, boolean u) { sens = p + 4; ControllerService c = ControllerService.inst; if (c != null) c.setSens(sens); sensLabel.setText("Aim sensitivity: " + (int) sens + " (higher = turns faster)"); }
             @Override public void onStartTrackingTouch(SeekBar s) {}
             @Override public void onStopTrackingTouch(SeekBar s) { getSharedPreferences(PREFS, MODE_PRIVATE).edit().putFloat("sens", sens).apply(); }
         });
@@ -122,7 +119,18 @@ public class MainActivity extends Activity implements SensorEventListener {
         sensLabel.setText("Aim sensitivity: " + (int) sens + " (higher = turns faster)");
         root.addView(sensBar);
 
-        root.addView(text("\nVOLUME UP = FIRE (hold to keep firing)\nVOLUME DOWN = JUMP\nPhone turn / tilt = aim. Hold the phone upright, back camera pointing at the laptop screen.", 16, true));
+        root.addView(text("\nVOLUME UP = FIRE (hold to keep firing)\nVOLUME DOWN = JUMP\nAIM MODE POINT: the direction the phone points is where you look (like a laser pointer). Hold the phone upright, back camera towards the laptop screen, tap RE-CENTRE.\nAIM MODE TILT: turning the phone moves the view (old behaviour).\nPOINT drifts slowly over time: tap RE-CENTRE whenever it wanders.\n\nSCREEN OFF: aim and the connection keep working with the screen off (a notification shows while running). But Android does not deliver the VOLUME buttons to apps when the screen is off, so fire/jump from volume keys need the screen ON. Recommended: leave 'Keep screen on' ticked.", 15, true));
+
+        CheckBox keep = new CheckBox(this);
+        keep.setText("Keep screen on (recommended for volume-key fire/jump)");
+        keep.setTextColor(Color.WHITE);
+        keep.setChecked(sp.getBoolean("keepOn", true));
+        keep.setOnCheckedChangeListener((cb, on) -> {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("keepOn", on).apply();
+            applyKeepOn(on);
+        });
+        root.addView(keep);
+        applyKeepOn(keep.isChecked());
 
         // On-screen backups
         LinearLayout row = new LinearLayout(this);
@@ -134,10 +142,6 @@ public class MainActivity extends Activity implements SensorEventListener {
         root.addView(row);
 
         setContentView(root);
-        sm = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
-        rot = sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
-        if (rot == null) rot = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
-        if (rot == null) say("This phone has no rotation sensor, so aim cannot work.");
     }
 
     private TextView text(String t, int sp, boolean bold) {
@@ -167,19 +171,27 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     private void say(final String s) { ui.post(() -> status.setText(s)); }
 
-    private void send(final String m) {
-        final MiniWebSocket w = ws;
-        if (w == null) return;
-        net.execute(() -> w.sendText(m));
+    private void modeText() {
+        modeBtn.setText("AIM MODE: " + (mode == ControllerService.MODE_POINT ? "POINT (tap to switch to TILT)" : "TILT (tap to switch to POINT)"));
+    }
+
+    private void applyKeepOn(boolean on) {
+        if (on) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
     private void setAction(boolean isFire, boolean on) {
-        if (isFire) { if (fireOn == on) return; fireOn = on; send("{\"t\":\"fire\",\"on\":" + on + "}"); }
-        else { if (jumpOn == on) return; jumpOn = on; send("{\"t\":\"jump\",\"on\":" + on + "}"); }
+        if (isFire) { if (fireOn == on) return; fireOn = on; } else { if (jumpOn == on) return; jumpOn = on; }
+        ControllerService c = ControllerService.inst;
+        if (c != null) c.setAction(isFire, on);
     }
 
     private void toggleConnect() {
-        if (ws != null) { disconnect("Disconnected."); return; }
+        if (ControllerService.inst != null) {
+            startService(new Intent(this, ControllerService.class).setAction(ControllerService.ACTION_STOP));
+            ui.postDelayed(refresh, 200);
+            return;
+        }
         String raw = urlBox.getText().toString().trim();
         if (raw.isEmpty()) { say("Type the laptop address first."); return; }
         if (!raw.contains("://")) raw = "https://" + raw;
@@ -192,75 +204,26 @@ public class MainActivity extends Activity implements SensorEventListener {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("url", urlBox.getText().toString().trim()).apply();
         InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         imm.hideSoftInputFromWindow(urlBox.getWindowToken(), 0);
-        say("Connecting to " + host + ":" + port + " ...");
+        Intent in = new Intent(this, ControllerService.class).setAction(ControllerService.ACTION_CONNECT)
+            .putExtra("host", host).putExtra("port", port).putExtra("tls", tls);
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(in); else startService(in);
         connectBtn.setText("DISCONNECT");
-        haveLast = false;
-        final MiniWebSocket[] holder = new MiniWebSocket[1];
-        holder[0] = new MiniWebSocket(host, port, tls, "/gyro?role=phone", new MiniWebSocket.Listener() {
-            @Override public void onOpen() {
-                ui.post(() -> { if (ws == holder[0]) say("Connected. Turn/tilt = aim. Vol UP = fire, Vol DOWN = jump. (Tap CONNECT PHONE in the game first.)"); });
-            }
-            @Override public void onClose(final String why) {
-                ui.post(() -> { if (ws == holder[0]) disconnect("Not connected: " + why + ". Check the address and that the game server is running."); });
-            }
-        });
-        ws = holder[0];
-        ws.connect();
-    }
-
-    private void disconnect(String msg) {
-        if (fireOn) setAction(true, false);
-        if (jumpOn) setAction(false, false);
-        final MiniWebSocket w = ws;
-        ws = null;
-        if (w != null) net.execute(w::close);
-        connectBtn.setText("CONNECT");
-        say(msg);
+        say("Connecting to " + host + ":" + port + " ...");
     }
 
     @Override protected void onResume() {
         super.onResume();
-        if (rot != null) sm.registerListener(this, rot, SensorManager.SENSOR_DELAY_GAME);
-        ui.post(flush);
+        ControllerService.statusListener = refresh;
+        refresh.run();
     }
 
     @Override protected void onPause() {
         super.onPause();
-        sm.unregisterListener(this);
-        ui.removeCallbacks(flush);
-        // Never leave a trigger stuck if the app goes to background.
+        ControllerService.statusListener = null;
+        // Never leave a trigger stuck if the app goes to background / screen off.
         if (fireOn) setAction(true, false);
         if (jumpOn) setAction(false, false);
     }
-
-    @Override protected void onDestroy() {
-        super.onDestroy();
-        final MiniWebSocket w = ws;
-        ws = null;
-        if (w != null) net.execute(w::close);
-        net.shutdown();
-    }
-
-    @Override public void onSensorChanged(SensorEvent e) {
-        SensorManager.getRotationMatrixFromVector(R, e.values);
-        // Phone held upright, back camera pointing forward: azimuth = which way it points,
-        // pitch = up/down.
-        SensorManager.remapCoordinateSystem(R, SensorManager.AXIS_X, SensorManager.AXIS_Z, R2);
-        SensorManager.getOrientation(R2, O);
-        float az = (float) Math.toDegrees(O[0]);
-        float pitch = (float) Math.toDegrees(O[1]);
-        if (!haveLast) { lastAz = az; lastPitch = pitch; haveLast = true; return; }
-        float da = az - lastAz;
-        if (da > 180) da -= 360; else if (da < -180) da += 360;
-        float dp = pitch - lastPitch;
-        lastAz = az; lastPitch = pitch;
-        if (Math.abs(da) > 30 || Math.abs(dp) > 30) return; // glitch spike
-        if (ws == null || !ws.isOpen()) return;
-        accX += da * sens;   // turn right = positive = game turns right
-        accY += dp * sens;   // camera up = pitch decreases = looks up
-    }
-
-    @Override public void onAccuracyChanged(Sensor s, int a) {}
 
     /** Volume keys are taken here before the system volume UI sees them. */
     @Override public boolean dispatchKeyEvent(KeyEvent ev) {

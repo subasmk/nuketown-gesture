@@ -19662,7 +19662,7 @@ addEventListener('DOMContentLoaded',()=>{
    (or the legacy browser page at /gyro-controller) connects and streams orientation deltas over
    a WebSocket on /gyro. While a phone is live it owns aim + fire and the
    webcam hand drives walking only; nothing leaves the hotspot. */
-const PHONE = { enabled: false, ws: null, liveUntil: 0, last: 0, lookX: 0, lookY: 0, fire: false, jump: false, holding: false };
+const PHONE = { enabled: false, ws: null, liveUntil: 0, last: 0, lookX: 0, lookY: 0, aim: null, applied: null, fire: false, jump: false, holding: false };
 function PHONE_JUMP() { return PHONE_LIVE() && PHONE.jump; }
 /* The gesture bridge asks this before applying webcam aim/fire. */
 function PHONE_LIVE() { return PHONE.enabled && PHONE.ws && PHONE.ws.readyState === 1 && performance.now() < PHONE.liveUntil; }
@@ -19672,8 +19672,22 @@ function phoneTick(dt) {
   const ok = PHONE.enabled && document.hasFocus() && !document.hidden && G.started && !G.paused && !G.over && G.player && G.player.alive;
   if (!PHONE_LIVE() || !ok || performance.now() - PHONE.last > 500) {
     PHONE.lookX = PHONE.lookY = 0;
+    PHONE.aim = PHONE.applied = null;
     phoneRelease();
     return;
+  }
+  /* POINT mode: the phone sends an absolute direction (degrees from its own
+     re-centre reference). Turn the camera by the difference from what was
+     already applied, so the view follows where the phone points. */
+  if (PHONE.aim && PHONE.applied) {
+    let dyaw = PHONE.aim.yaw - PHONE.applied.yaw;
+    if (dyaw > 180) dyaw -= 360; else if (dyaw < -180) dyaw += 360;
+    const dpitch = PHONE.aim.pitch - PHONE.applied.pitch;
+    PHONE.applied = { yaw: PHONE.aim.yaw, pitch: PHONE.aim.pitch };
+    if (dyaw || dpitch) {
+      const k = Math.PI / 180 / mouseSens; /* game look units per degree */
+      applyLook(dyaw * k, -dpitch * k, mouseSens);
+    }
   }
   if (PHONE.lookX || PHONE.lookY) { applyLook(PHONE.lookX, PHONE.lookY, mouseSens); PHONE.lookX = PHONE.lookY = 0; }
   if (PHONE.fire && !IN.firing) { pressFire(); PHONE.holding = true; }
@@ -19694,9 +19708,15 @@ function phoneConnect() {
       if (m.t === 'look') {
         PHONE.lookX = Math.max(-500, Math.min(500, PHONE.lookX + (+m.dx || 0)));
         PHONE.lookY = Math.max(-500, Math.min(500, PHONE.lookY + (+m.dy || 0)));
+      } else if (m.t === 'aim') {
+        const yaw = Math.max(-180, Math.min(180, +m.yaw || 0));
+        const pitch = Math.max(-80, Math.min(80, +m.pitch || 0));
+        PHONE.aim = { yaw, pitch };
+        /* First aim, or the phone re-centred: adopt it without moving the camera. */
+        if (m.reset || !PHONE.applied) PHONE.applied = { yaw, pitch };
       } else if (m.t === 'fire') PHONE.fire = !!m.on;
       else if (m.t === 'jump') PHONE.jump = !!m.on;
-      phoneStatus(PHONE.fire ? 'Phone live — FIRING' : 'Phone live — tilt aims, Vol UP shoots, Vol DOWN jumps. Webcam hand = walking.');
+      phoneStatus(PHONE.fire ? 'Phone live — FIRING' : 'Phone live — point aims, Vol UP shoots, Vol DOWN jumps. Webcam hand = walking.');
     } catch {}
   };
   ws.onclose = () => { if (PHONE.ws === ws) { PHONE.ws = null; phoneRelease(); phoneStatus('Phone disconnected. Tap CONNECT PHONE to retry.'); } };
@@ -19705,7 +19725,7 @@ function phoneConnect() {
 addEventListener('DOMContentLoaded', () => {
   const box = document.createElement('section'); box.id = 'phone-panel';
   box.style.cssText = 'position:fixed;right:8px;bottom:8px;z-index:100000;width:230px;padding:8px;background:#182431ed;color:white;font:12px system-ui;border-radius:10px';
-  box.innerHTML = '<b>PHONE AIM</b><br><div id="phone-status" role="status">Off. Tap CONNECT PHONE, then open the link on the phone.</div><button id="phone-connect">CONNECT PHONE</button><br><span id="phone-link"></span><br>Phone tilt = screen turn | phone Vol UP = shoot | Vol DOWN = jump<br>While live, webcam hand = WALKING only';
+  box.innerHTML = '<b>PHONE AIM</b><br><div id="phone-status" role="status">Off. Tap CONNECT PHONE, then open the link on the phone.</div><button id="phone-connect">CONNECT PHONE</button><br><span id="phone-link"></span><br>Point the phone = look there (or TILT mode) | phone Vol UP = shoot | Vol DOWN = jump<br>While live, webcam hand = WALKING only';
   document.body.append(box);
   const link = document.getElementById('phone-link');
   try { link.textContent = location.origin + '/gyro-controller (browser fallback) or the Android app'; } catch {}

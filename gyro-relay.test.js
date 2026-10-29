@@ -73,3 +73,35 @@ test('game wiring: phone jump feeds the local input and the Windows build includ
   assert.match(fs.readFileSync('build-windows.mjs', 'utf8'), /phone-gyro\.js/);
   assert.match(fs.readFileSync('build-windows.mjs', 'utf8'), /phone-bridge\.js/);
 });
+
+test('gyro relay forwards absolute point-mode aim messages verbatim', async (t) => {
+  const port = await startRelay(t);
+  const game = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=game`);
+  await new Promise((resolve) => game.once('open', resolve));
+  const phone = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=phone`);
+  await new Promise((resolve) => phone.once('open', resolve));
+  const received = new Promise((resolve) => game.once('message', (data) => resolve(data.toString())));
+  phone.send(JSON.stringify({ t: 'aim', yaw: -12.5, pitch: 7, reset: true }));
+  assert.deepEqual(JSON.parse(await received), { t: 'aim', yaw: -12.5, pitch: 7, reset: true });
+  game.close();
+  phone.close();
+});
+
+test('android app wiring: POINT/TILT toggle, re-centre, foreground service with wake lock', async () => {
+  const fs = await import('node:fs');
+  const dir = new URL('./android-controller/app/src/main/', import.meta.url);
+  const manifest = fs.readFileSync(new URL('AndroidManifest.xml', dir), 'utf8');
+  const svc = fs.readFileSync(new URL('java/com/subasmk/nuketown/ControllerService.java', dir), 'utf8');
+  const act = fs.readFileSync(new URL('java/com/subasmk/nuketown/MainActivity.java', dir), 'utf8');
+  assert.match(manifest, /ControllerService/);
+  assert.match(manifest, /FOREGROUND_SERVICE/);
+  assert.match(manifest, /WAKE_LOCK/);
+  assert.match(svc, /PARTIAL_WAKE_LOCK/);
+  assert.match(svc, /startForeground/);
+  assert.match(svc, /"\{\\"t\\":\\"aim\\"/);
+  assert.match(svc, /\\"reset\\":true/);
+  assert.match(act, /AIM MODE/);
+  assert.match(act, /RE-CENTRE/);
+  assert.match(act, /KEYCODE_VOLUME_UP/);
+  assert.match(act, /KEYCODE_VOLUME_DOWN/);
+});
