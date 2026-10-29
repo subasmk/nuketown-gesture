@@ -175,6 +175,7 @@ function frame(now) {
   lastT = now;
   if (dt > 0.25) dt = 0.25;
   updateAdaptiveRes(dt);
+  if(typeof gestureTick==='function')gestureTick(dt);
   netFrame(now);
 
   if (!G.frozen) {
