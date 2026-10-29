@@ -24,6 +24,7 @@ const ROOT_DIR = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_INDEX_PATH = resolve(ROOT_DIR, 'index.html');
 const DEFAULT_PROTOCOL_PATH = resolve(ROOT_DIR, 'net-protocol.js');
 const DEFAULT_CONTROLLER_PATH = resolve(ROOT_DIR, 'phone-controller.html');
+const DEFAULT_BROWSER_CONTROLLER_PATH = resolve(ROOT_DIR, 'controller.html');
 
 const RELAY_TYPES = new Set(['snapshot', 'checkpoint', 'event']);
 const CHECKPOINT_CONTROLLERS = new Set(['local', 'remote', 'bot']);
@@ -102,6 +103,7 @@ export function createRelayServer(options = {}) {
   const indexPath = options.indexPath || DEFAULT_INDEX_PATH;
   const protocolPath = options.protocolPath || DEFAULT_PROTOCOL_PATH;
   const controllerPath = options.controllerPath || DEFAULT_CONTROLLER_PATH;
+  const browserControllerPath = options.browserControllerPath || DEFAULT_BROWSER_CONTROLLER_PATH;
   const maxMessageBytes = positiveInteger(
     options.maxMessageBytes,
     Protocol.MAX_MESSAGE_BYTES
@@ -755,8 +757,13 @@ export function createRelayServer(options = {}) {
       filePath = indexPath;
       contentType = 'text/html; charset=utf-8';
     } else if (pathname === '/controller') {
-      /* Phone gyro controller page: same laptop server, same LAN trust as
-         the game page itself. */
+      /* Browser phone controller (pairing code): same laptop server, same
+         LAN trust as the game page itself. */
+      filePath = browserControllerPath;
+      contentType = 'text/html; charset=utf-8';
+    } else if (pathname === '/gyro-controller') {
+      /* Legacy browser gyro page for the /gyro relay protocol (the native
+         Android controller app speaks the same protocol). */
       filePath = controllerPath;
       contentType = 'text/html; charset=utf-8';
     } else if (pathname === '/net-protocol.js') {
@@ -1884,6 +1891,50 @@ export function createRelayServer(options = {}) {
     sendError(peer, 'unknown-type', 'Unknown message type.');
   }
 
+  /* Browser phone-controller channel (v3 expo addition). A phone pairs
+     with a short code and streams input; the game page that owns the code
+     listens. Controller peers never join a room, so registration also
+     cancels the room-handshake timeout. Nothing here can affect room
+     state: phones can only talk to listeners holding their code. */
+  const ctlPhones = new Map();    // pairing code -> phone peer
+  const ctlListeners = new Map(); // pairing code -> Set of game-page peers
+  function ctlCodeOf(message) {
+    const c = String(message.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    return c.length >= 4 && c.length <= 6 ? c : null;
+  }
+  function handleCtl(peer, message) {
+    if (message.t === 'ctl-hello' || message.t === 'ctl-listen') {
+      const code = ctlCodeOf(message);
+      if (!code) { sendError(peer, 'ctl-code', 'Invalid controller code.'); return; }
+      if (peer.joinTimer) { clearTimeout(peer.joinTimer); peer.joinTimer = null; }
+      if (message.t === 'ctl-hello') {
+        const prev = ctlPhones.get(code);
+        if (prev && prev !== peer) { try { prev.ws.close(1000, 'controller replaced'); } catch (error) {} }
+        ctlPhones.set(code, peer);
+        peer.ctlPhoneCode = code;
+        send(peer, { t: 'ctl-ok', v: Protocol.VERSION, role: 'phone' });
+        const set = ctlListeners.get(code);
+        if (set) for (const l of set) send(l, { t: 'ctl-status', v: Protocol.VERSION, phone: true });
+        peer.ws.once('close', () => {
+          if (ctlPhones.get(code) === peer) ctlPhones.delete(code);
+          const s = ctlListeners.get(code);
+          if (s) for (const l of s) send(l, { t: 'ctl-status', v: Protocol.VERSION, phone: false });
+        });
+      } else {
+        let set = ctlListeners.get(code);
+        if (!set) { set = new Set(); ctlListeners.set(code, set); }
+        set.add(peer);
+        send(peer, { t: 'ctl-ok', v: Protocol.VERSION, role: 'listener', phone: ctlPhones.has(code) });
+        peer.ws.once('close', () => { set.delete(peer); if (!set.size) ctlListeners.delete(code); });
+      }
+      return;
+    }
+    if ((message.t === 'ctl' || message.t === 'ctl-centre') && peer.ctlPhoneCode) {
+      const set = ctlListeners.get(peer.ctlPhoneCode);
+      if (set) for (const l of set) send(l, message);
+    }
+  }
+
   function handleMessage(peer, raw) {
     if (peer.moderated) return;
     if (!consumeRateToken(peer)) {
@@ -1910,6 +1961,10 @@ export function createRelayServer(options = {}) {
          the protocol tells them nothing they can act on; "reload" is the whole
          remedy, so say that instead. */
       sendError(peer, 'version', 'This game is out of date. Reload the page to keep playing.');
+      return;
+    }
+    if (typeof message.t === 'string' && message.t.startsWith('ctl')) {
+      handleCtl(peer, message);
       return;
     }
     if (messageShape === MESSAGE_SHAPE_FORBIDDEN_PROGRESS) {

@@ -13,9 +13,18 @@ async function startRelay(t, options = {}) {
   return relay.address().port;
 }
 
-test('the phone controller page is served at /controller', async (t) => {
+test('the browser pairing controller page is served at /controller', async (t) => {
   const port = await startRelay(t);
   const response = await fetch(`http://127.0.0.1:${port}/controller`);
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /NUKETOWN CONTROLLER/);
+  assert.match(body, /deviceorientation/);
+});
+
+test('the legacy gyro controller page is served at /gyro-controller', async (t) => {
+  const port = await startRelay(t);
+  const response = await fetch(`http://127.0.0.1:${port}/gyro-controller`);
   assert.equal(response.status, 200);
   const body = await response.text();
   assert.match(body, /PHONE CONTROLLER/);
@@ -62,4 +71,5 @@ test('game wiring: phone jump feeds the local input and the Windows build includ
   assert.match(fs.readFileSync('src/70-game.js', 'utf8'), /PHONE_JUMP/);
   assert.match(fs.readFileSync('phone-gyro.js', 'utf8'), /t === 'jump'/);
   assert.match(fs.readFileSync('build-windows.mjs', 'utf8'), /phone-gyro\.js/);
+  assert.match(fs.readFileSync('build-windows.mjs', 'utf8'), /phone-bridge\.js/);
 });

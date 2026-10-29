@@ -16,7 +16,8 @@ relay.listen(port,'0.0.0.0',()=>{
   if(addrs.length){
     console.log('FRIEND OPENS (same hotspot/Wi-Fi): https://'+addrs[0]+':'+port);
     for(const a of addrs.slice(1))console.log('  (other adapter, usually ignore: https://'+a+':'+port+')');
-    console.log('PHONE AIM (optional): https://'+addrs[0]+':'+port+'/controller  (open on the phone, same Wi-Fi)');
+    console.log('PHONE AIM (native Android app): connect to '+addrs[0]+':'+port+' - or open https://'+addrs[0]+':'+port+'/gyro-controller on the phone browser');
+    console.log('PHONE CONTROLLER (browser, no install): open https://'+addrs[0]+':'+port+'/controller on the phone and enter the 4-letter code shown on the laptop panel.');
     console.log('Friend browser shows a certificate warning: Advanced -> Proceed. Expected — it is your own laptop.');
     console.log('If the page does not load at all: Windows Firewall -> allow Node.js on PRIVATE networks, and use https:// (not http://).');
   } else {

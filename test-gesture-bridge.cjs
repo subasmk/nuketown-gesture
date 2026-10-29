@@ -5,3 +5,10 @@ ctx.G.paused=false;g.last=now;g.ax=1;g.ay=1;g.fire=true;ctx.PHONE_LIVE=()=>true;
 const before=shots;look=null;ctx.gestureTick(.016);
 assert.equal(shots,before);assert.equal(look,null);
 console.log('PASS live phone overrides gesture aim and pinch');
+
+/* A paired browser controller (CTL_LIVE) also owns aim+fire over gestures. */
+ctx.PHONE_LIVE=()=>false;ctx.CTL_LIVE=()=>true;
+const before2=shots;look=null;ctx.gestureTick(.016);
+assert.equal(shots,before2);assert.equal(look,null);
+ctx.CTL_LIVE=undefined;ctx.PHONE_LIVE=()=>false;
+console.log('PASS live browser controller overrides gesture aim and pinch');

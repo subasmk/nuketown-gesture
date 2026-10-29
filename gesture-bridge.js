@@ -5,9 +5,10 @@ function gestureAccepts(){return GESTURE.enabled && document.hasFocus()&&!docume
 function gestureTick(dt){
   const panel=document.getElementById?.('gesture-panel');if(panel){panel.style.top=G.started?'85px':'auto';panel.style.bottom=G.started?'auto':'8px';}
   if(!gestureAccepts()||performance.now()-GESTURE.last>400){gestureStop();return;}
-  /* A live phone owns aim + fire; the webcam hand then drives walking
-     only, so gesture look and pinch must not fight the phone. */
-  const phoneAim=typeof PHONE_LIVE!=='undefined'&&PHONE_LIVE();
+  /* A live phone (native app or paired browser controller) owns aim + fire;
+     the webcam hand then drives walking only, so gesture look and pinch
+     must not fight the phone. */
+  const phoneAim=(typeof PHONE_LIVE!=='undefined'&&PHONE_LIVE())||(typeof CTL_LIVE!=='undefined'&&CTL_LIVE());
   if(!phoneAim){
     applyLook(GESTURE.ax*600*Math.min(dt,.05),GESTURE.ay*460*Math.min(dt,.05),mouseSens);
     if(GESTURE.fire&&!IN.firing)pressFire();

@@ -1,5 +1,5 @@
-/* Phone gyroscope aim for the expo build. Local LAN only: the phone opens
-   /controller on this same laptop server and streams orientation deltas over
+/* Phone gyroscope aim for the expo build. Local LAN only: the native app
+   (or the legacy browser page at /gyro-controller) connects and streams orientation deltas over
    a WebSocket on /gyro. While a phone is live it owns aim + fire and the
    webcam hand drives walking only; nothing leaves the hotspot. */
 const PHONE = { enabled: false, ws: null, liveUntil: 0, last: 0, lookX: 0, lookY: 0, fire: false, jump: false, holding: false };
@@ -48,7 +48,7 @@ addEventListener('DOMContentLoaded', () => {
   box.innerHTML = '<b>PHONE AIM</b><br><div id="phone-status" role="status">Off. Tap CONNECT PHONE, then open the link on the phone.</div><button id="phone-connect">CONNECT PHONE</button><br><span id="phone-link"></span><br>Phone tilt = screen turn | phone Vol UP = shoot | Vol DOWN = jump<br>While live, webcam hand = WALKING only';
   document.body.append(box);
   const link = document.getElementById('phone-link');
-  try { link.textContent = location.origin + '/controller'; } catch {}
+  try { link.textContent = location.origin + '/gyro-controller (browser fallback) or the Android app'; } catch {}
   document.getElementById('phone-connect').onclick = phoneConnect;
   addEventListener('blur', () => { PHONE.lookX = PHONE.lookY = 0; phoneRelease(); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) { PHONE.lookX = PHONE.lookY = 0; phoneRelease(); } });
