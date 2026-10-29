@@ -33,6 +33,7 @@ function setGameMode(mode) {
 }
 
 function matchTarget() {
+  if (typeof NET !== 'undefined' && NET.duel && netIsMultiplayer()) return 1;
   return G.mode === 'kc' ? CFG.confirmsToWin : CFG.killsToWin;
 }
 
@@ -43,7 +44,7 @@ function checkMatchWin() {
     if (top.confirms >= CFG.confirmsToWin && !G.over) endMatch(top);
   } else {
     const top = G.actors.reduce((m, a) => a.kills > m.kills ? a : m, G.actors[0]);
-    if (top.kills >= CFG.killsToWin && !G.over) endMatch(top);
+    if (top.kills >= matchTarget() && !G.over) endMatch(top);
   }
 }
 
