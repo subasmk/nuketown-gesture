@@ -2,6 +2,7 @@ import { randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -696,6 +697,10 @@ export function createRelayServer(options = {}) {
       return;
     }
 
+    if (pathname.startsWith('/vendor/')) {
+      const vendor = pathname.startsWith('/vendor/hands/') ? resolve(ROOT_DIR,'node_modules/@mediapipe/hands',pathname.slice(14)) : pathname.startsWith('/vendor/camera_utils/') ? resolve(ROOT_DIR,'node_modules/@mediapipe/camera_utils',pathname.slice(21)) : pathname==='/vendor/three.min.js' ? resolve(ROOT_DIR,'node_modules/three/build/three.min.js') : null;
+      if(vendor && !pathname.includes('..')){try{const body=await readFile(vendor);response.writeHead(200,{'content-type':vendor.endsWith('.js')?'application/javascript':vendor.endsWith('.wasm')?'application/wasm':'application/octet-stream'});response.end(body);}catch{response.writeHead(404);response.end();}return;}
+    }
     if (await handleAdminHttp(request, response, pathname)) return;
 
     if (accountStore && await accountStore.handleHttp(request, response, requestUrl))
@@ -770,7 +775,8 @@ export function createRelayServer(options = {}) {
     }
   }
 
-  const server = createHttpServer((request, response) => {
+  const createServer = options.tls ? (handler => createHttpsServer(options.tls,handler)) : createHttpServer;
+  const server = createServer((request, response) => {
     handleHttp(request, response).catch(() => {
       if (!response.headersSent) {
         response.writeHead(500, {
@@ -2412,4 +2418,4 @@ if (isMain) {
   };
   process.once('SIGINT', shutdown);
   process.once('SIGTERM', shutdown);
-}
+        }
