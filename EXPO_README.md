@@ -61,3 +61,15 @@ Any phone on the same hotspot can drive a laptop without installing anything - g
 3. Hold the phone sideways. Turning it turns the view (delta-based: any starting pose works, no calibration). Left thumb stick moves (push far = sprint), FIRE holds to shoot, JUMP jumps. If up/down aim feels inverted on that phone, click **FLIP ↕ AIM** on the laptop panel.
 4. Android Chrome only, experimental: with the controller connected, **VOL UP = fire burst, VOL DOWN = jump**, detected via the media-volume change of a silent loop the page plays (browsers never receive volume key presses directly). It does not work on iOS; the on-screen buttons always work. For reliable volume keys use the native Android app (item 8) - both controllers work against the same server and can even be connected at once (one per panel).
 5. While a browser phone is streaming it owns aim + fire (same rule as the native app), and the webcam hand drives WALKING only; the phone's own stick also moves. The relay channel is code-scoped: a phone can only reach the laptop page listening on its code, and it cannot touch room state. The legacy browser gyro page moved to `/gyro-controller`; `/controller` now serves this pairing page.
+
+## Finger walking (v5)
+
+Connect the native Android app with CONNECT PHONE (PHONE AIM panel), or pair the browser controller through ENABLE CTLP and its 4-letter code at /controller. Then ENABLE CAMERA on the laptop. While either phone is streaming, the gesture panel automatically enables MOVE ONLY. Phone = aim/fire/jump; the free webcam hand = walking.
+
+- Extend index/middle/ring/little fingers: 1 = forward, 2 = back, 3 = right, 4 = left. The thumb is ignored. Fist or no hand stops immediately.
+- Hold a new direction for at least 80 ms to engage it; transient shapes do not select a direction. Finger-tip distance from the wrist is compared with its middle joint, rather than screen up/down. Physical tracking still needs a visible, unoccluded hand.
+- MOVE ONLY button is a manual override until reload. ON uses finger walking and parks webcam aim/pinch; OFF restores the existing full gesture controls. Even in manual OFF, a live phone keeps aim/fire priority.
+- With no phone stream, auto mode returns to full gestures with fresh automatic neutrals: one hand aims + light pinch fires, second palm moves.
+- Native volume UP = fire, volume DOWN = jump is unchanged. Browser on-screen FIRE/JUMP and stick still work; its Chrome volume trick is experimental. /gyro-controller remains the legacy fallback.
+
+New tests cover finger directions, rotation/scale, the 80 ms stability gate, immediate fist/hand-loss stop, mode changes, watchdog, and both phone types retaining fire while webcam tracking stops. Camera and physical-phone testing on the booth laptops is still required.

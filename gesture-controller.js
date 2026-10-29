@@ -21,6 +21,22 @@ window.GestureControl = (() => {
   let aim = { x: 0, y: 0 }, move = { x: 0, z: 0 }, firing = false;
   let pinchState = false, pinchSince = 0;
 
+  // Move-only mode: the phone (gyro app) aims and fires, so the webcam
+  // hand gives movement by FINGER COUNT (Subash's scheme):
+  //   1 finger = forward, 2 = back, 3 = right, 4 = left, fist = stop.
+  // The bridge enables this automatically while a phone is connected.
+  let moveOnly = false, moveCmd = { x: 0, z: 0 }, pendingCount = -1, pendingSince = 0;
+  // A finger is extended when its tip reaches clearly farther from the
+  // wrist than its middle joint, independent of screen rotation.
+  // Include landmark depth for tilted hands; occlusion still limits tracking.
+  const fingerDist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, (a.z || 0) - (b.z || 0));
+  function countFingers(p) {
+    let n = 0;
+    for (const [tip, pip] of [[8, 6], [12, 10], [16, 14], [20, 18]])
+      if (fingerDist(p[tip], p[0]) > fingerDist(p[pip], p[0]) * 1.08) n++;
+    return n;
+  }
+
   // Per-role tracking. A role exists only while its hand is seen.
   function newRole() { return { seen: 0, lastSeenAt: 0, cand: null, candN: 0, neutral: null, pos: null }; }
   const roles = { aim: newRole(), move: newRole() };
@@ -40,7 +56,7 @@ window.GestureControl = (() => {
   }
   function zeroRole(role) {
     if (role === 'aim') { aim = { x: 0, y: 0 }; firing = false; pinchState = false; }
-    else { move = { x: 0, z: 0 }; }
+    else { move = { x: 0, z: 0 }; moveCmd = { x: 0, z: 0 }; pendingCount = -1; pendingSince = 0; }
   }
   function clearAll(message) { zeroRole('aim'); zeroRole('move'); emit(); if (message) report(message); }
 
@@ -80,8 +96,37 @@ window.GestureControl = (() => {
     detected = all.length;
     const now = lastAt;
     if (!all.length) {
-      for (const name of ['aim', 'move']) if (now - roles[name].lastSeenAt > 200) zeroRole(name);
-      emit(); report('No hands in frame. One hand = aim + pinch fire; add the other to move.');
+      for (const name of ['aim', 'move']) if (moveOnly || now - roles[name].lastSeenAt > 200) zeroRole(name);
+      emit(); report(moveOnly ? 'No hand in frame. STOP. Show fingers: 1 front, 2 back, 3 right, 4 left.' : 'No hands in frame. One hand = aim + pinch fire; add the other to move.');
+      return;
+    }
+    if (moveOnly) {
+      // Movement by finger count (prefer the physical left hand — the
+      // phone usually sits in the right). Aim and fire stay parked at
+      // zero; the phone owns them. A count must hold ~80 ms before it
+      // engages, so passing shapes mid-change do not jerk the player.
+      let mi = labels.findIndex(x => x?.label === 'Right');
+      if (mi < 0) mi = 0;
+      roles.move.lastSeenAt = now; roles.move.pos = center(all[mi]);
+      aim = { x: 0, y: 0 }; firing = false; pinchState = false;
+      const count = countFingers(all[mi]);
+      // Fist is an emergency stop, not a delayed direction change.
+      if (count === 0) { zeroRole('move'); emit(); report('MOVE ONLY: fist - STOP'); return; }
+      if (count !== pendingCount) { pendingCount = count; pendingSince = now; }
+      if (now - pendingSince >= 80) {
+        moveCmd = count === 1 ? { x: 0, z: 1 }
+          : count === 2 ? { x: 0, z: -1 }
+          : count === 3 ? { x: 1, z: 0 }
+          : count === 4 ? { x: -1, z: 0 }
+          : { x: 0, z: 0 };
+      }
+      move.x += .5 * (moveCmd.x - move.x);
+      move.z += .5 * (moveCmd.z - move.z);
+      if (moveCmd.x === 0 && Math.abs(move.x) < .08) move.x = 0;
+      if (moveCmd.z === 0 && Math.abs(move.z) < .08) move.z = 0;
+      emit();
+      const label = moveCmd.z > 0 ? 'FORWARD' : moveCmd.z < 0 ? 'BACK' : moveCmd.x > 0 ? 'RIGHT' : moveCmd.x < 0 ? 'LEFT' : 'STOP';
+      report(`MOVE ONLY (finger walking): ${count} finger${count === 1 ? '' : 's'} → ${label} · 1 front · 2 back · 3 right · 4 left`);
       return;
     }
     // Role assignment: the hand labelled 'Left' is the player's physical
@@ -170,5 +215,17 @@ window.GestureControl = (() => {
     }, 100);
     document.addEventListener('visibilitychange', () => { if (document.hidden) clearAll('Paused: tab hidden'); });
   }
-  return { start, calibrate, capture };
+  function setMoveOnly(v) {
+    if (moveOnly === !!v) return;
+    moveOnly = !!v;
+    // Switching back must take fresh neutrals, not reuse a phone-holding pose.
+    for (const name of ['aim', 'move']) roles[name] = newRole();
+    pinchSince = 0;
+    zeroRole('aim'); zeroRole('move');
+    emit();
+    report(moveOnly
+      ? 'MOVE ONLY: fingers give movement (1 front, 2 back, 3 right, 4 left), phone aims + fires.'
+      : 'Full gesture: one hand aims + pinch fires, second hand moves.');
+  }
+  return { start, calibrate, capture, setMoveOnly, isMoveOnly: () => moveOnly };
 })();

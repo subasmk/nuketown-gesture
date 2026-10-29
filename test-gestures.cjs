@@ -117,4 +117,33 @@ function frames(n, make) { for (let i = 0; i < n; i++) { clock += 30; frame(...m
   frames(6, () => [[AIM(0.05, -0.05)]]);
   assert.deepStrictEqual(aim, [0, 0]);
   console.log('PASS recalibrate settles at the new pose');
+  // 10. Move-only mode (phone aims): movement by finger count —
+  // 1 = forward, 2 = back, 3 = right, 4 = left, fist = stop.
+  // Aim and fire must stay parked whatever the hand does.
+  function fingerHand(fingers) { // [index, middle, ring, pinky] extended?
+    const p = Array.from({ length: 21 }, () => ({ x: 0.4, y: 0.6 }));
+    p[0] = { x: 0.4, y: 0.75 };
+    const kx = [0.34, 0.38, 0.42, 0.46];
+    [5, 9, 13, 17].forEach((lm, i) => { p[lm] = { x: kx[i], y: 0.6 }; });
+    [6, 10, 14, 18].forEach((lm, i) => { p[lm] = { x: kx[i], y: 0.555 }; });
+    [8, 12, 16, 20].forEach((lm, i) => { p[lm] = fingers[i] ? { x: kx[i], y: 0.51 } : { x: kx[i], y: 0.585 }; });
+    p[4] = { x: 0.3, y: 0.62 };
+    return p;
+  }
+  const showFingers = (f, n = 6) => frames(n, () => [[fingerHand(f)]]);
+  context.window.GestureControl.setMoveOnly(true);
+  showFingers([true, false, false, false]);
+  assert(move[1] > 0.5, '1 finger = forward, got ' + move);
+  assert.deepStrictEqual(aim, [0, 0]);
+  assert.strictEqual(fire, false);
+  showFingers([true, true, false, false]);
+  assert(move[1] < -0.5, '2 fingers = back, got ' + move);
+  showFingers([true, true, true, false]);
+  assert(move[0] > 0.5, '3 fingers = right, got ' + move);
+  showFingers([true, true, true, true]);
+  assert(move[0] < -0.5, '4 fingers = left, got ' + move);
+  showFingers([false, false, false, false], 9);
+  assert.deepStrictEqual(move, [0, 0]);
+  context.window.GestureControl.setMoveOnly(false);
+  console.log('PASS move-only finger count: 1 front, 2 back, 3 right, 4 left, fist stops');
 })().catch(e => { console.error(e); process.exitCode = 1; });
