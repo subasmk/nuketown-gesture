@@ -109,6 +109,7 @@ function netAdoptMap(id) {
 
 const NET = {
   mode: 'solo',                 // solo | connecting | host | guest
+  duel: false,
   phase: 'idle',                // idle | connecting | lobby | playing
   socket: null,
   room: '',
@@ -296,6 +297,7 @@ function netSetActorCosmetics(actor, value) {
    combatant count are the same number: fill every seat and this returns zero.
    A guest builds only itself and takes the rest of the map from snapshots. */
 function netBotCount(humanCount) {
+  if (NET.duel && netIsMultiplayer()) return 0;
   if (netIsGuest()) return 0;
   if (netIsHost()) return Math.max(0, CFG.combatants - humanCount);
   return CFG.bots;
@@ -868,7 +870,7 @@ function netSyncRematchButton() {
     again.textContent = 'WAITING FOR HOST';
     again.disabled = true;
   } else if (netIsHost()) {
-    again.textContent = 'START REMATCH';
+    again.textContent = NET.duel ? 'NEXT ROUND / SAME PAIR' : 'START REMATCH';
     again.disabled = false;
   } else {
     again.textContent = 'REMATCH';
@@ -908,7 +910,7 @@ function netRenderMembers() {
     list.appendChild(li);
   }
   const count = document.getElementById('rosterCount');
-  if (count) count.textContent = NET.members.length + ' / ' + (NETP ? NETP.MAX_PLAYERS : 9);
+  if (count) count.textContent = NET.members.length + ' / ' + (NET.duel ? 2 : (NETP ? NETP.MAX_PLAYERS : 9));
   netRenderLobbyMap();
 }
 
@@ -934,6 +936,7 @@ function netResetTransport() {
     try { NET.socket.close(1000, 'leaving'); } catch (e) {}
   }
   NET.socket = null;
+  NET.duel = false;
   NET.mode = 'solo';
   NET.phase = 'idle';
   NET.room = '';
@@ -987,7 +990,7 @@ function netResetTransport() {
   NET.manualClose = false;
 }
 
-function netConnect(kind, requestedRoom, quickPlan) {
+function netConnect(kind, requestedRoom, quickPlan, rules) {
   if (!NETP || typeof WebSocket !== 'function') {
     netStatus('Multiplayer is not supported in this browser.', 'error');
     netSetMenuBusy(false);
@@ -1017,7 +1020,7 @@ function netConnect(kind, requestedRoom, quickPlan) {
   netResetTransport();
   NET.mode = 'connecting';
   NET.phase = 'connecting';
-  NET.wanted = { kind, name, room, listed, map, maps,
+  NET.wanted = { kind, name, room, listed, map, maps, rules: rules === 'duel' ? 'duel' : 'standard',
     cosmetics: netEquippedCosmetics() };
   /* Reinstalled after the reset: a quick-play run outlives the individual
      connection attempts it is made of. */
@@ -1048,7 +1051,7 @@ function netConnect(kind, requestedRoom, quickPlan) {
     const w = NET.wanted;
     const hello = {
       t: w.kind, v: NETP.VERSION, room: w.room, name: w.name,
-      listed: w.listed, map: w.map, maps: w.maps, cosmetics: w.cosmetics
+      listed: w.listed, rules: w.rules, map: w.map, maps: w.maps, cosmetics: w.cosmetics
     };
     const authToken = netAuthTokenForSocket(socketURL);
     if (authToken) hello.authToken = authToken;
@@ -1132,6 +1135,8 @@ function netHandleWire(raw) {
     NET.id = msg.id;
     NET.room = room;
     NET.mode = msg.role === 'host' ? 'host' : 'guest';
+    NET.duel = msg.rules === 'duel';
+    if (NET.duel) setGameMode('dm');
     /* A guest has not learned the match mode yet. Keep the lobby neutral until
        the authority's first snapshot arrives, regardless of the URL that led
        this browser here; a host keeps the mode it chose before creating. */
@@ -1157,6 +1162,10 @@ function netHandleWire(raw) {
     }
     netUpdateAutoStart(msg.autoStartIn);
     netShowLobby();
+    if (NET.duel) {
+      netStatus('1v1 FIRST KILL WINS - 2 humans, no bots. Host: wait for both players, then START MATCH.');
+      return;
+    }
     netStatus(netIsHost()
       ? (opened
           ? 'Nothing to join, so this room is yours — copy the invite, or start now with bots.'
@@ -1209,6 +1218,11 @@ function netHandleWire(raw) {
     const members = netCleanMembers(msg.members);
     if (!netIsMultiplayer() || !members || !members.some(member => member.id === NET.id)) return;
     NET.members = members;
+    if (NET.duel && NET.phase === 'playing' && !G.over && members.length !== 2) {
+      netLeaveMatch('1v1 cancelled: opponent left. No winner awarded. Create a new room for the next pair.');
+      return;
+    }
+    if (NET.duel && NET.phase === 'lobby') netStatus(members.length === 2 ? '1v1 FIRST KILL WINS - Both players ready. Host: START MATCH.' : '1v1 FIRST KILL WINS - Waiting for opponent.');
     /* An unknown id here is not worth ending a session over: it is a forecast
        for a round that has not started, and the start message is where a map
        this page cannot build actually becomes a problem. Forget it instead,
@@ -1252,6 +1266,8 @@ function netHandleWire(raw) {
       netEndSession('This round uses a map this page cannot build. Reload to continue.');
       return;
     }
+    NET.duel = msg.rules === 'duel';
+    if (NET.duel) setGameMode('dm');
     NET.round = msg.round;
     NET.members = members;
     NET.nextMap = null;
@@ -1421,6 +1437,7 @@ function netArmStartTimeout() {
 function netHostStart() {
   if (!netIsHost() || NET.starting ||
       (NET.phase !== 'lobby' && NET.phase !== 'playing')) return;
+  if (NET.duel && NET.members.length !== 2) { netStatus('1v1 needs two players before starting.', 'error'); return; }
   NET.starting = true;
   netArmStartTimeout();
   const start = document.getElementById('netStart');
@@ -1933,6 +1950,7 @@ function netAdmitArrivals() {
    seats means a full room can empty out to two players and an empty map, so
    the bots that stood aside for the humans come back when they go. */
 function netBackfillBots() {
+  if (NET.duel) return;
   if (!netIsHost() || NET.phase !== 'playing' || G.over) return;
   const spare = freeJerseys(G.actors);
   const missing = Math.min(CFG.combatants - G.actors.length, spare.length);
@@ -3085,6 +3103,10 @@ function initNetworkUI() {
     roomsShow(false);
     netConnect('create');
   });
+  document.getElementById('hostDuel')?.addEventListener('click', () => {
+    roomsShow(false);
+    netConnect('create', null, null, 'duel');
+  });
   document.getElementById('joinGame').addEventListener('click', () => {
     roomsShow(false);
     netConnect('join', roomInput.value);
@@ -3141,4 +3163,4 @@ function initNetworkUI() {
       netStatus('Room code: ' + NET.room);
     }
   });
-}
+     }
