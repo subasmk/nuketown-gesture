@@ -12,7 +12,7 @@ const elCross = { u: $('cU'), d: $('cD'), l: $('cL'), r: $('cR') };
 let crossSpread = 8, crossPunch = 0, hitmarkT = 0, dmgFlash = 0, healFlash = 0;
 
 function uiScore(a) { return G.mode === 'kc' ? (a.confirms || 0) : a.kills; }
-function uiTarget() { return G.mode === 'kc' ? CFG.confirmsToWin : CFG.killsToWin; }
+function uiTarget() { return matchTarget(); }
 
 /* Where the scoreboard lives when no full-screen card is up. */
 const boardHome = elBoard.parentNode;
@@ -295,10 +295,12 @@ function updateDeadScreen() {
 function showOverScreen(winner) {
   const rows = G.actors.slice().sort((a, b) => uiScore(b) - uiScore(a) || b.kills - a.kills);
   const place = rows.indexOf(G.player) + 1;
-  $('overBig').textContent = winner.isPlayer ? 'YOU WIN!' : (winner.name + ' WINS');
+  $('overBig').textContent = NET.duel ? (winner.name + ' WINS!') : (winner.isPlayer ? 'YOU WIN!' : (winner.name + ' WINS'));
+  if (NET.duel) $('overRank').textContent = 'FIRST KILL WINS';
   const scoreText = G.mode === 'kc' ? G.player.confirms + ' confirms' : G.player.kills + ' kills';
   $('overRank').textContent = 'You placed #' + place + ' of ' + rows.length +
     '  ·  ' + scoreText + ' / ' + G.player.deaths + ' deaths  ·  best streak ' + G.player.bestStreak;
+  if (NET.duel) $('overRank').textContent = 'FIRST KILL WINS | New pair: MAIN MENU, new names, new room.';
   refreshBoard();
   const over = $('over');
   /* Ahead of the button row, not ahead of the button: the row is the child
