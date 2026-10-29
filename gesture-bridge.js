@@ -3,6 +3,7 @@ const GESTURE = {enabled:false,fwd:0,strafe:0,ax:0,ay:0,fire:false,mouse:false,l
 function gestureStop(){GESTURE.fwd=GESTURE.strafe=GESTURE.ax=GESTURE.ay=0;GESTURE.fire=false;if(!GESTURE.mouse)releaseFire();}
 function gestureAccepts(){return GESTURE.enabled && document.hasFocus()&&!document.hidden&&G.started&&!G.paused&&!G.over&&G.player&&G.player.alive;}
 function gestureTick(dt){
+  const panel=document.getElementById?.('gesture-panel');if(panel){panel.style.top=G.started?'85px':'auto';panel.style.bottom=G.started?'auto':'8px';}
   if(!gestureAccepts()||performance.now()-GESTURE.last>400){gestureStop();return;}
   // applyLook expects pixel deltas, positive dy looks DOWN. Right aim y is positive UP.
   applyLook(GESTURE.ax*700*Math.min(dt,.05),-GESTURE.ay*550*Math.min(dt,.05),mouseSens);
