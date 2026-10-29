@@ -1,3 +1,5 @@
+> PRIVATE LOCAL GESTURE VARIANT: use [EXPO_README.md](EXPO_README.md) for the Windows/HTTPS camera run steps. Original project, history and rights notice retained below. This is not permission from the original author and must not be made public.
+
 # Pastel Nuketown — Browser Multiplayer FPS Game
 
 Pastel Nuketown is a free-to-play first-person shooter (FPS) game that runs entirely in the browser. Built with Three.js and vanilla JavaScript, it features a pastel-styled Nuketown-inspired arena with host-authoritative multiplayer over WebSockets. Play solo against AI bots or create a room for up to 9 players. No downloads, no plugins, no accounts — open the page and play.
