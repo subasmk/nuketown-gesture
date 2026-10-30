@@ -44,6 +44,19 @@ test('gyro relay forwards phone input to the game page', async (t) => {
   phone.close();
 });
 
+test('gyro relay forwards phone weapon-select messages to the game page', async (t) => {
+  const port = await startRelay(t);
+  const game = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=game`);
+  await new Promise((resolve) => game.once('open', resolve));
+  const phone = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=phone`);
+  await new Promise((resolve) => phone.once('open', resolve));
+  const received = new Promise((resolve) => game.once('message', (data) => resolve(data.toString())));
+  phone.send(JSON.stringify({ t: 'weapon', slot: 2 }));
+  assert.deepEqual(JSON.parse(await received), { t: 'weapon', slot: 2 });
+  game.close();
+  phone.close();
+});
+
 test('unrelated websocket paths are still refused', async (t) => {
   const port = await startRelay(t);
   const ws = new WebSocket(`ws://127.0.0.1:${port}/nope`);
@@ -104,4 +117,24 @@ test('android app wiring: POINT/TILT toggle, re-centre, foreground service with 
   assert.match(act, /RE-CENTRE/);
   assert.match(act, /KEYCODE_VOLUME_UP/);
   assert.match(act, /KEYCODE_VOLUME_DOWN/);
+});
+
+test('android app wiring: full-screen gun cards send weapon slots 1-3, version 3', async () => {
+  const fs = await import('node:fs');
+  const dir = new URL('./android-controller/app/', import.meta.url);
+  const svc = fs.readFileSync(new URL('src/main/java/com/subasmk/nuketown/ControllerService.java', dir), 'utf8');
+  const act = fs.readFileSync(new URL('src/main/java/com/subasmk/nuketown/MainActivity.java', dir), 'utf8');
+  const gradle = fs.readFileSync(new URL('build.gradle', dir), 'utf8');
+  // the app's gun list is the game's real weapon list, in keyboard 1/2/3 order
+  const weapons = fs.readFileSync('src/40-weapons.js', 'utf8');
+  for (const name of ['BUBBLEGUN', 'MARSHMALLOW', 'LOLLIPOP']) {
+    assert.match(act, new RegExp(name));
+    assert.match(weapons, new RegExp(`name: '${name}'`));
+  }
+  assert.match(svc, /setWeapon/);
+  assert.match(svc, /"{\\"t\\":\\"weapon\\"/);
+  assert.match(svc, /slot < 1 \|\| slot > 3/);
+  assert.match(act, /c\.setWeapon\(slot\)/);
+  assert.match(gradle, /versionCode 3/);
+  assert.match(gradle, /versionName '3\.0'/);
 });

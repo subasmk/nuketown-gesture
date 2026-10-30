@@ -54,6 +54,16 @@ function phoneConnect() {
         PHONE.aim = { yaw, pitch };
         /* First aim, or the phone re-centred: adopt it without moving the camera. */
         if (m.reset || !PHONE.applied) PHONE.applied = { yaw, pitch };
+      } else if (m.t === 'weapon') {
+        /* Gun select from the app's full-screen weapon cards. Slot numbers are
+           the same ones the keyboard uses: 1/2/3 -> smg/shotgun/rifle, and the
+           switch goes through the same switchWeapon() those keys call. Same
+           arbitration as fire/jump: the phone must be live and the round
+           running, so a stale phone (or a menu tap) cannot swap guns. */
+        const order = ['smg', 'shotgun', 'rifle'];
+        const id = order[Math.round(+m.slot) - 1];
+        if (id && PHONE_LIVE() && G.started && !G.paused && !G.over
+            && G.player && G.player.alive && typeof switchWeapon === 'function') switchWeapon(id);
       } else if (m.t === 'fire') PHONE.fire = !!m.on;
       else if (m.t === 'jump') PHONE.jump = !!m.on;
       phoneStatus(PHONE.fire ? 'Phone live — FIRING' : 'Phone live — point aims, Vol UP shoots, Vol DOWN jumps. Webcam hand = walking.');

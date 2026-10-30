@@ -215,6 +215,13 @@ public class ControllerService extends Service implements SensorEventListener {
         net.execute(() -> w.sendText(m));
     }
 
+    /** Gun select from the app's weapon cards: 1 = BUBBLEGUN, 2 = MARSHMALLOW, 3 = LOLLIPOP
+        (the same slots the game's 1/2/3 keys use). */
+    public void setWeapon(int slot) {
+        if (slot < 1 || slot > 3) return;
+        send("{\"t\":\"weapon\",\"slot\":" + slot + "}");
+    }
+
     public void setAction(boolean isFire, boolean on) {
         if (isFire) { if (fireOn == on) return; fireOn = on; send("{\"t\":\"fire\",\"on\":" + on + "}"); }
         else { if (jumpOn == on) return; jumpOn = on; send("{\"t\":\"jump\",\"on\":" + on + "}"); }

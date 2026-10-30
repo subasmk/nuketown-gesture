@@ -31,3 +31,18 @@ Studio. Debug APK: `app/build/outputs/apk/debug/app-debug.apk`. Sideload by allo
   "Keep screen on" ticked (default) for volume-key play.
 - The debug APK is signed with whatever debug key the build machine has. v2 was built on a new
   machine, so it has a different signature from v1: uninstall v1 before installing v2.
+
+## v3.0: full-screen gun select and a redesigned UI
+
+- Once connected, the app switches to a full-screen **gun select**: the game's three weapons as
+  large tappable cards - BUBBLEGUN (SMG), MARSHMALLOW (shotgun), LOLLIPOP (rifle), in the same
+  order as the keyboard 1/2/3. Tapping a card sends `{"t":"weapon","slot":n}` over the same /gyro
+  WebSocket and the game switches through the same `switchWeapon()` path as the 1/2/3 keys, with
+  the same phone-live arbitration as fire/jump. Big FIRE / JUMP and RE-CENTRE / DISCONNECT sit
+  below the cards; volume keys keep working as before.
+- Whole UI redesigned: dark modern card layout, clearer hierarchy, gun cards tinted with each
+  weapon's in-game colour. Still a single plain-Java activity, no new dependencies.
+- Signing: the debug key is now committed (`debug.keystore`, standard `android`/`androiddebugkey`
+  passwords), so every build from v3 on signs identically and installs over the previous version.
+  **v3 does NOT install over v2** - v2 was signed with a build-machine key that no longer exists.
+  Uninstall v2 first; after that, upgrades are clean.

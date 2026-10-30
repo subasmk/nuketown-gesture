@@ -15,7 +15,8 @@ const ctx = {
   addEventListener: (k, f) => callbacks[k] = f,
   pressFire: () => { shots++; ctx.IN.firing = true; },
   releaseFire: () => { releases++; ctx.IN.firing = false; },
-  applyLook: (...x) => look = x, console
+  applyLook: (...x) => look = x,
+  switchWeapon: (id) => { (ctx.switched = ctx.switched || []).push(id); }, console
 };
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(require('path').join(__dirname, 'phone-gyro.js'), 'utf8') +
@@ -116,4 +117,35 @@ console.log('PASS pause gates phone input');
   now += 600; PHONE.last = now - 600; phoneTick(.016);         // stale drops the aim reference
   assert.strictEqual(PHONE.aim, null);
   console.log('PASS point mode: absolute aim, no drift, wraparound, clamp, re-centre, tilt still works');
+}
+
+// 7. Weapon select from the app's full-screen gun cards: slot numbers map to
+// the same switchWeapon() the 1/2/3 keys call, with phone-live arbitration.
+{
+  ctx.switched = [];
+  PHONE.ws = null; PHONE.enabled = false;
+  ctx.G.started = true; ctx.G.paused = false; ctx.G.over = false; ctx.G.player = { alive: true };
+  ctx.phoneConnect();
+  const sock = ctx.lastSocket;
+  const feed = (o) => { now += 10; sock.onmessage({ data: JSON.stringify(o) }); };
+
+  feed({ t: 'weapon', slot: 2 });
+  assert.deepStrictEqual(ctx.switched, ['shotgun'], 'slot 2 = shotgun, same as key 2');
+  feed({ t: 'weapon', slot: 1 });
+  feed({ t: 'weapon', slot: 3 });
+  assert.deepStrictEqual(ctx.switched, ['shotgun', 'smg', 'rifle'], 'slots 1/3 = smg/rifle');
+
+  feed({ t: 'weapon', slot: 4 });
+  feed({ t: 'weapon', slot: 0 });
+  feed({ t: 'weapon', slot: 'x' });
+  assert.strictEqual(ctx.switched.length, 3, 'invalid slots are ignored');
+
+  ctx.G.paused = true;
+  feed({ t: 'weapon', slot: 2 });
+  assert.strictEqual(ctx.switched.length, 3, 'paused round ignores weapon switch');
+  ctx.G.paused = false; ctx.G.player.alive = false;
+  feed({ t: 'weapon', slot: 2 });
+  assert.strictEqual(ctx.switched.length, 3, 'dead player ignores weapon switch');
+  ctx.G.player.alive = true;
+  console.log('PASS weapon select: slots map to the real guns, invalid/paused/dead ignored');
 }
