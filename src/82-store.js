@@ -3137,6 +3137,10 @@ function menuHudSettingsOpen(open) {
   if (open) panel.setAttribute('data-open', '');
   else panel.removeAttribute('data-open');
   gear.setAttribute('aria-expanded', String(!!open));
+  /* The floating phone/gesture helper panels follow the popover: hidden
+     until settings is opened, hidden again when it closes. */
+  if (typeof document !== 'undefined' && document.body)
+    document.body.toggleAttribute('data-settings-open', !!open);
 }
 
 function menuHudInit() {
@@ -3193,4 +3197,4 @@ function menuHudInit() {
     } catch (e) {}
   }
   menuHudRender();
-}
+                            }
