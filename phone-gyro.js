@@ -20,13 +20,19 @@ function phoneTick(dt) {
      re-centre reference). Turn the camera by the difference from what was
      already applied, so the view follows where the phone points. */
   if (PHONE.aim && PHONE.applied) {
+    /* Chase the latest sample instead of jumping to it: aim messages land
+       every ~20-40ms, so applying the whole delta on arrival stair-steps the
+       camera. A ~45ms time constant spreads each step across frames; a reset
+       still adopts instantly above, so re-centring never slides. */
+    const chase = 1 - Math.exp(-dt / 0.045);
     let dyaw = PHONE.aim.yaw - PHONE.applied.yaw;
     if (dyaw > 180) dyaw -= 360; else if (dyaw < -180) dyaw += 360;
     const dpitch = PHONE.aim.pitch - PHONE.applied.pitch;
-    PHONE.applied = { yaw: PHONE.aim.yaw, pitch: PHONE.aim.pitch };
-    if (dyaw || dpitch) {
+    const sy = dyaw * chase, sp = dpitch * chase;
+    PHONE.applied = { yaw: PHONE.applied.yaw + sy, pitch: PHONE.applied.pitch + sp };
+    if (sy || sp) {
       const k = Math.PI / 180 / mouseSens; /* game look units per degree */
-      applyLook(dyaw * k, -dpitch * k, mouseSens);
+      applyLook(sy * k, -sp * k, mouseSens);
     }
   }
   if (PHONE.lookX || PHONE.lookY) { applyLook(PHONE.lookX, PHONE.lookY, mouseSens); PHONE.lookX = PHONE.lookY = 0; }

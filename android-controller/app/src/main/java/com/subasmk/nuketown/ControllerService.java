@@ -55,7 +55,7 @@ public class ControllerService extends Service implements SensorEventListener {
     private PowerManager.WakeLock wake;
 
     private volatile int mode = MODE_POINT;
-    private volatile float sens = 13f;
+    private volatile float sens = 18f;
     private boolean fireOn, jumpOn;
     private final float[] R = new float[9], R2 = new float[9], O = new float[3];
 
@@ -67,7 +67,7 @@ public class ControllerService extends Service implements SensorEventListener {
     private float refAz, refPitch, curYaw, curPitch;
     private boolean haveAim;
     // POINT smoothing: raw sensor angles jitter; an EMA keeps the reticle steady
-    // without noticeable lag (alpha chosen for the 25 Hz flush).
+    // without noticeable lag (alpha chosen for the 50 Hz flush).
     private boolean haveSmooth;
     private float smYaw, smPitch;
 
@@ -94,7 +94,7 @@ public class ControllerService extends Service implements SensorEventListener {
                     accX = accY = 0;
                 }
             } else { accX = accY = 0; }
-            ui.postDelayed(this, 40);
+            ui.postDelayed(this, 20);
         }
     };
 
@@ -122,7 +122,7 @@ public class ControllerService extends Service implements SensorEventListener {
 
     private void loadPrefs() {
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        sens = sp.getFloat("sens", 13f);
+        sens = sp.getFloat("sens", 18f);
         mode = sp.getInt("mode", MODE_POINT);
     }
 

@@ -91,7 +91,7 @@ public class MainActivity extends Activity {
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
-        sens = sp.getFloat("sens", 13f);
+        sens = sp.getFloat("sens", 18f);
         mode = sp.getInt("mode", ControllerService.MODE_POINT);
         if (Build.VERSION.SDK_INT >= 33) requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1);
 
