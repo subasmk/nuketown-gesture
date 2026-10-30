@@ -12,7 +12,7 @@
    much the phone itself turned since the previous message, so any
    holding pose works and there is no calibration step. A FLIP button
    covers phones whose pitch axis runs the other way. */
-const CTLP = { on: false, connected: false, fire: false, pressedByUs: false, lastA: null, lastP: null, lookX: 0, lookY: 0, lastMsg: 0, flipY: false, code: '' };
+const CTLP = { on: false, connected: false, fire: false, pressedByUs: false, lastA: null, lastP: null, lookX: 0, lookY: 0, lastMsg: 0, flipY: false, code: '', sens: 1 };
 const CTL_PX_PER_DEG = 8;
 /* The gesture bridge asks this before applying webcam aim/fire: while a
    paired browser phone is streaming, it owns aim + fire (same rule as the
@@ -38,6 +38,8 @@ function ctlHandleMessage(m) {
     return;
   }
   if (m.t !== 'ctl' || !Array.isArray(m.o)) return;
+  /* Sensitivity from the phone's slider: 1 = the original fixed feel. */
+  if (typeof m.sn === 'number' && isFinite(m.sn)) CTLP.sens = Math.max(0.25, Math.min(3, m.sn));
   CTLP.connected = true;
   CTLP.lastMsg = performance.now();
   const [a, b, g] = m.o;
@@ -46,8 +48,9 @@ function ctlHandleMessage(m) {
   if (CTLP.lastA !== null) {
     const dYaw = ctlAngDelta(a, CTLP.lastA);
     const dPitch = pitch - CTLP.lastP;
-    if (Math.abs(dYaw) < 60) CTLP.lookX += dYaw * CTL_PX_PER_DEG;   // turning phone right lowers alpha -> handled by sign below
-    if (Math.abs(dPitch) < 60) CTLP.lookY += (CTLP.flipY ? -dPitch : dPitch) * CTL_PX_PER_DEG;
+    const px = CTL_PX_PER_DEG * CTLP.sens;
+    if (Math.abs(dYaw) < 60) CTLP.lookX += dYaw * px;   // turning phone right lowers alpha -> handled by sign below
+    if (Math.abs(dPitch) < 60) CTLP.lookY += (CTLP.flipY ? -dPitch : dPitch) * px;
   }
   CTLP.lastA = a; CTLP.lastP = pitch;
   if (Array.isArray(m.j) && typeof TOUCH !== 'undefined') {
