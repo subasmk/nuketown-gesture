@@ -1,0 +1,2566 @@
+import { randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { createServer as createHttpServer } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { WebSocket, WebSocketServer } from 'ws';
+import { createAccountStoreFromEnvironment } from './account-store.mjs';
+import {
+  BATTLE_PASS_MAX_RETRY_DELAY_MS,
+  BATTLE_PASS_MAX_RETRY_ATTEMPTS,
+  BATTLE_PASS_MIN_MATCH_DURATION_MS,
+  BATTLE_PASS_MIN_PARTICIPANTS,
+  BATTLE_PASS_MIN_SNAPSHOTS
+} from './battlepass.mjs';
+import { COSMETICS_BY_ID } from './cosmetics.mjs';
+import { HttpError, readJsonBody, sendJson } from './http-utils.mjs';
+import { clientAddressFromRequest, createBanRegistry } from './moderation.mjs';
+import Protocol from './net-protocol.js';
+
+const ROOT_DIR = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_INDEX_PATH = resolve(ROOT_DIR, 'index.html');
+const DEFAULT_PROTOCOL_PATH = resolve(ROOT_DIR, 'net-protocol.js');
+const DEFAULT_CONTROLLER_PATH = resolve(ROOT_DIR, 'phone-controller.html');
+const DEFAULT_BROWSER_CONTROLLER_PATH = resolve(ROOT_DIR, 'controller.html');
+
+const RELAY_TYPES = new Set(['snapshot', 'checkpoint', 'event']);
+const CHECKPOINT_CONTROLLERS = new Set(['local', 'remote', 'bot']);
+const CHECKPOINT_SKILLS = new Set(['easy', 'normal', 'hard']);
+const EVENT_KINDS = new Set(['shot', 'shield', 'damage', 'kill', 'respawn', 'match-over']);
+/* Progress does not exist on the wire. Rejecting these names explicitly makes
+   an attempted shortcut visible to the sender and prevents a future relay
+   message from accidentally reusing one as a trusted input. */
+const CLIENT_PROGRESS_FIELDS = new Set([
+  'xp',
+  'tier',
+  'reward',
+  'rewardId',
+  'rewardUnlock',
+  'claimedRewards'
+]);
+const MESSAGE_SHAPE_SAFE = 0;
+const MESSAGE_SHAPE_INVALID = 1;
+const MESSAGE_SHAPE_FORBIDDEN_PROGRESS = 2;
+/* Mirrors FIXED in src/90-main.js. A guest sends one input per simulated tick,
+   so the gap between two `seq` values is how much simulated time separates the
+   two aim samples in them -- which is what an angular rate needs, and is not
+   the same thing as how far apart the packets happened to arrive. */
+const SIMULATION_HZ = 60;
+
+function positiveInteger(value, fallback) {
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+function positiveNumber(value, fallback) {
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function secureRandom() {
+  return randomInt(0, 0x100000000) / 0x100000000;
+}
+
+function memberList(room) {
+  return Array.from(room.members.values(), (peer) => {
+    const member = {
+      id: peer.id,
+      name: peer.name,
+      role: peer.role,
+      slot: peer.slot
+    };
+    if (Protocol.hasCosmetics(peer.cosmetics))
+      member.cosmetics = Protocol.sanitizeCosmetics(peer.cosmetics);
+    return member;
+  });
+}
+
+function catalogAcceptsCosmetic(id, kind, slot) {
+  const item = COSMETICS_BY_ID.get(id);
+  return !!item && item.type === kind && item.slot === slot;
+}
+
+/* The lowest jersey nobody in the room is wearing. Seats are a room resource
+   rather than a roster position because both ends of the roster move: people
+   drop in mid-round and people leave mid-round, and a colour derived from
+   position would follow them, redressing half the map every time. Held for as
+   long as its occupant is in the room, free the moment they are not.
+
+   The room is capped at exactly as many seats as there are jerseys, so the
+   scan always finds one; the fallback is there to have an answer, not because
+   it can be reached. */
+function claimSlot(room) {
+  const taken = new Set(Array.from(room.members.values(), (peer) => peer.slot));
+  for (let slot = 0; slot < Protocol.MAX_PLAYERS; slot++) {
+    if (!taken.has(slot)) return slot;
+  }
+  return 0;
+}
+
+export function createRelayServer(options = {}) {
+  const relayNow = typeof options.now === 'function' ? options.now : Date.now;
+  const indexPath = options.indexPath || DEFAULT_INDEX_PATH;
+  const protocolPath = options.protocolPath || DEFAULT_PROTOCOL_PATH;
+  const controllerPath = options.controllerPath || DEFAULT_CONTROLLER_PATH;
+  const browserControllerPath = options.browserControllerPath || DEFAULT_BROWSER_CONTROLLER_PATH;
+  const maxMessageBytes = positiveInteger(
+    options.maxMessageBytes,
+    Protocol.MAX_MESSAGE_BYTES
+  );
+  const ratePerSecond = positiveInteger(options.ratePerSecond, 90);
+  const rateBurst = positiveInteger(options.rateBurst, 120);
+  const heartbeatMs = options.heartbeatMs === 0
+    ? 0
+    : positiveInteger(options.heartbeatMs, 30_000);
+  /* How long a guest may hold a seat in a running match without playing.
+     A capped room and drop-in together make an idle body expensive: it is
+     not just a body doing nothing, it is a body somebody else could be, and
+     the fuller the room the more true that gets. Zero disables the sweep
+     entirely. */
+  const idleKickMs = options.idleKickMs === 0
+    ? 0
+    : positiveInteger(options.idleKickMs, 60_000);
+  /* Fine enough that "a minute" means roughly a minute rather than up to two,
+     cheap enough to be irrelevant: it walks a map of at most a few hundred. */
+  const idleSweepMs = Math.max(50, Math.min(5_000, Math.floor(idleKickMs / 4) || 5_000));
+  /* How fast a guest claims to be turning, in radians per second, before the
+     relay stops believing a hand is doing it. Aim is the one input nobody can
+     check against the world from here, so this checks it against physiology
+     instead.
+
+     Measured over a window rather than per input, because per input is not a
+     rate a human produces evenly: the client simulates a fixed 60Hz but
+     samples the mouse once a frame, so a guest running at 30fps legitimately
+     delivers a whole frame's turn in one tick and neutral turns in the next.
+     Averaging over a quarter second puts those back together.
+
+     30 rad/s was the first guess at "far above what a fast player peaks at",
+     and the first hours of live traffic disagreed: honest players in a
+     firefight measure 30 to 42, crossing that line often enough to log and
+     never often enough to accumulate. A threshold sitting inside normal is not
+     a threshold. 120 is clear of the whole observed cluster and still only a
+     third of what a wrapped yaw and a clamped pitch can express between two
+     ticks, which leaves it pointed at the one thing that does reach it: a
+     client spinning on purpose, some twenty revolutions a second, to make
+     itself hard to shoot. It cannot see a bot that tracks smoothly. Nothing
+     measured from here can -- that needs the world, and the world is on the
+     host. */
+  const aimRateLimit = positiveNumber(options.aimRateLimit, 120);
+  const aimRateWindowTicks = positiveInteger(options.aimRateWindowTicks, 15);
+  /* Windows over the limit, net of the clean windows that pay them back,
+     before the seat is taken back. 0 watches without ever acting.
+
+     This is the half of the measurement that separates a cheat from a bad
+     quarter of a second, and it is why the limit alone was never enough. One
+     window over is a client that hitched: a phone that dropped frames, a tab
+     that stalled, something unexplained and over before it could be looked
+     at. A client spinning to stay alive is over on every consecutive window,
+     so it reaches a small count inside a second while an isolated burst decays
+     back to nothing and costs its owner a strike they never notice.
+
+     Zero stays the default for a relay nobody has told what its own traffic
+     looks like. */
+  const aimRateStrikes = positiveInteger(options.aimRateStrikes, 0);
+  const backpressureBytes = positiveInteger(
+    options.backpressureBytes,
+    512 * 1024
+  );
+  const hardBackpressureBytes = positiveInteger(
+    options.hardBackpressureBytes,
+    2 * 1024 * 1024
+  );
+  const maxConnections = positiveInteger(options.maxConnections, 512);
+  const maxRooms = positiveInteger(options.maxRooms, 128);
+  const maxListedRooms = positiveInteger(options.maxListedRooms, Protocol.MAX_ROOM_LIST);
+  /* WebSockets are exempt from the same-origin policy, so without this any
+     page in the world can open a socket here and sit in the rooms. An empty
+     allowlist keeps that wide-open behaviour, which is what local play,
+     file:// pages and the tests rely on — set it in production. */
+  const allowedOrigins = new Set(
+    (Array.isArray(options.allowedOrigins) ? options.allowedOrigins : [])
+      .map((origin) => String(origin).trim().replace(/\/+$/, '').toLowerCase())
+      .filter(Boolean)
+  );
+
+  function originAllowed(request) {
+    if (allowedOrigins.size === 0) return true;
+    const origin = request.headers.origin;
+    if (typeof origin !== 'string' || !origin) return false;
+    return allowedOrigins.has(origin.trim().replace(/\/+$/, '').toLowerCase());
+  }
+  const joinTimeoutMs = positiveInteger(options.joinTimeoutMs, 15_000);
+  const promotionTimeoutMs = positiveInteger(options.promotionTimeoutMs, 3_000);
+  const snapshotStallCount = positiveInteger(options.snapshotStallCount, 24);
+  /* That count prices the watchdog in observed snapshot intervals, which a
+     fresh authority has not established yet -- and both `start` and a completed
+     migration deliberately discard the previous host's cadence. This guards
+     that gap: a flat deadline for an authority to prove it is simulating at
+     all. Fifty snapshot intervals is far too long to be reached by a host that
+     is merely slow, and short enough that walking a roomful of dead candidates
+     costs seconds rather than the best part of a minute. */
+  const authorityGraceMs = positiveInteger(options.authorityGraceMs, 2_500);
+  /* How long a room with someone to play against waits before starting itself.
+     This clock lives here rather than in the host's page because the case it
+     exists for is a host who is not looking at their page: a backgrounded tab
+     throttles its timers to a crawl and a locked phone stops them dead, so the
+     one browser that could start the match is the one browser guaranteed not
+     to. Short, because drop-in means a late arrival walks into the round
+     already running rather than missing it. Zero disables the clock. */
+  const autoStartMs = options.autoStartMs === 0
+    ? 0
+    : positiveInteger(options.autoStartMs, 5_000);
+  /* HOLD buys a host keeping a seat for a friend more time; it cannot buy them
+     silence. Every press pushes the deadline out by this much and no further,
+     so a host who presses it and wanders off blocks the room for half a minute
+     instead of forever. */
+  const autoStartHoldMs = positiveInteger(options.autoStartHoldMs, 30_000);
+  /* And how many times in a row. Without a cap, "press HOLD again" is a way to
+     keep a room shut indefinitely — which is the behaviour this whole clock
+     exists to take away, just with a script doing the waiting. */
+  const autoStartMaxHolds = positiveInteger(options.autoStartMaxHolds, 2);
+  /* Between rounds the same clock runs longer. A room in a lobby is people
+     waiting to play; a room on a scoreboard is people reading one, and
+     yanking that away five seconds after the winning shot is its own kind of
+     nobody-asked-me. */
+  const autoStartRematchMs = positiveInteger(options.autoStartRematchMs, 12_000);
+  const makeId = typeof options.idFactory === 'function'
+    ? options.idFactory
+    : randomUUID;
+  const makeMatchId = typeof options.matchIdFactory === 'function'
+    ? options.matchIdFactory
+    : randomUUID;
+  const battlePassRetryMs = positiveInteger(options.battlePassRetryMs, 1_000);
+  const battlePassMaxRetryAttempts = positiveInteger(
+    options.battlePassMaxRetryAttempts,
+    BATTLE_PASS_MAX_RETRY_ATTEMPTS
+  );
+  const maxUnrecordedBattlePassMatches = positiveInteger(
+    options.maxUnrecordedBattlePassMatches,
+    100
+  );
+  const roomRandom = typeof options.roomRandom === 'function'
+    ? options.roomRandom
+    : secureRandom;
+  /* Where the lifetime match count lives across restarts. No path means no
+     persistence: the count still runs, it just starts at zero each boot, which
+     is what the tests and local play want. */
+  const statsPath = typeof options.statsPath === 'string' && options.statsPath
+    ? options.statsPath
+    : null;
+  const statsFlushMs = positiveInteger(options.statsFlushMs, 10_000);
+  const adminToken = typeof options.adminToken === 'string' ? options.adminToken : '';
+  if (adminToken && (adminToken.length < 32 || adminToken.length > 512 ||
+      !/^[\x21-\x7e]+$/.test(adminToken))) {
+    throw new Error('adminToken must be 32-512 visible ASCII characters.');
+  }
+
+  const rooms = new Map();
+  const peers = new Map();
+  const unrecordedBattlePassMatches = new Map();
+  let droppedUnrecordedBattlePassMatches = 0;
+  let battlePassRetryTimer = null;
+  let battlePassRetryAt = null;
+  const bans = options.banRegistry || createBanRegistry({
+    path: typeof options.banPath === 'string' && options.banPath ? options.banPath : null,
+    now: relayNow,
+    idFactory: options.banIdFactory
+  });
+
+  /* Lifetime matches played, for the title screen. This counts entries into a
+     room, not people: there are no accounts, so the only thing that could tell
+     two players apart is their address, and keeping a record of every visitor's
+     address to decorate a menu is a bad trade. One player who plays five rounds
+     is five here, which is why the client says MATCHES and not PLAYERS. */
+  let matchesPlayed = 0;
+  let statsWritable = statsPath !== null;
+  let statsTimer = null;
+  let statsDirty = false;
+  let statsWriteFailed = false;
+
+  if (statsPath) {
+    try {
+      const saved = JSON.parse(readFileSync(statsPath, 'utf8'));
+      const count = saved && saved.matches;
+      if (!Number.isSafeInteger(count) || count < 0)
+        throw new Error(`expected a non-negative integer, got ${JSON.stringify(count)}`);
+      matchesPlayed = count;
+    } catch (error) {
+      if (error && error.code === 'ENOENT') {
+        /* First boot on a fresh host. Nothing to read, everything to write. */
+      } else {
+        /* The file exists but will not parse. Starting from zero *and* writing
+           would overwrite a real history with a wrong number on the next flush,
+           so stop writing and leave the file for a human. The relay keeps
+           serving; a broken counter is not worth refusing to host games over. */
+        statsWritable = false;
+        console.error(
+          `Refusing to write ${statsPath}: could not read the existing count (${error.message}). ` +
+          'The lifetime match count will not be saved until this file is fixed or removed.'
+        );
+      }
+    }
+  }
+
+  /* Temp file plus rename, so a crash midway through leaves the old count
+     intact rather than a truncated file that reads as corrupt forever. */
+  function flushStats() {
+    if (!statsDirty || !statsWritable) return;
+    const temp = `${statsPath}.${process.pid}.tmp`;
+    try {
+      writeFileSync(temp, `${JSON.stringify({ matches: matchesPlayed })}\n`);
+      renameSync(temp, statsPath);
+      statsDirty = false;
+      statsWriteFailed = false;
+    } catch (error) {
+      /* Say it once. A read-only state directory would otherwise print this
+         every flush for the life of the process. */
+      if (!statsWriteFailed) {
+        statsWriteFailed = true;
+        console.error(`Unable to save the match count to ${statsPath}: ${error.message}`);
+      }
+    }
+  }
+
+  function countMatchPlayed() {
+    matchesPlayed++;
+    if (!statsWritable) return;
+    statsDirty = true;
+    /* Batched: a full room is four writes in a few seconds, and this number is
+       decoration — losing the last few seconds of it to a hard kill is fine. */
+    if (statsTimer) return;
+    statsTimer = setTimeout(() => {
+      statsTimer = null;
+      flushStats();
+    }, statsFlushMs);
+    if (typeof statsTimer.unref === 'function') statsTimer.unref();
+  }
+
+  /* JSON.parse accepts extremely deep values. Walk iteratively so hostile
+     payloads cannot turn a later String()/JSON.stringify() into stack
+     exhaustion, and keep relay messages cheap enough to fan out safely. */
+  function inspectMessageShape(root) {
+    const stack = [{ value: root, depth: 0 }];
+    let nodes = 0;
+    let hasForbiddenProgress = false;
+    while (stack.length) {
+      const { value, depth } = stack.pop();
+      if (++nodes > 4096 || depth > 8) return MESSAGE_SHAPE_INVALID;
+      if (value === null || typeof value === 'boolean' || typeof value === 'number') continue;
+      if (typeof value === 'string') {
+        if (value.length > 2048) return MESSAGE_SHAPE_INVALID;
+        continue;
+      }
+      if (Array.isArray(value)) {
+        if (value.length > 512) return MESSAGE_SHAPE_INVALID;
+        for (const item of value) stack.push({ value: item, depth: depth + 1 });
+        continue;
+      }
+      if (typeof value !== 'object') return MESSAGE_SHAPE_INVALID;
+      const keys = Object.keys(value);
+      if (keys.length > 64) return MESSAGE_SHAPE_INVALID;
+      for (const key of keys) {
+        if (CLIENT_PROGRESS_FIELDS.has(key)) hasForbiddenProgress = true;
+        stack.push({ value: value[key], depth: depth + 1 });
+      }
+    }
+    return hasForbiddenProgress
+      ? MESSAGE_SHAPE_FORBIDDEN_PROGRESS
+      : MESSAGE_SHAPE_SAFE;
+  }
+
+  function encode(message) {
+    try { return JSON.stringify(message); }
+    catch (error) { return null; }
+  }
+
+  function safeCount(value) {
+    return Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000;
+  }
+
+  function validCheckpointEvent(event, actorIds) {
+    if (!event || typeof event !== 'object' || Array.isArray(event) ||
+        !Number.isSafeInteger(event.id) || event.id < 1 ||
+        !EVENT_KINDS.has(event.kind)) return false;
+    const known = (id) => typeof id === 'string' && actorIds.has(id);
+    const point = (value) => Array.isArray(value) && value.length === 3 &&
+      value.every((n) => Number.isFinite(n) && n >= -200 && n <= 200);
+    const source = event.from === null || known(event.from);
+    if (event.kind === 'shot') {
+      return known(event.from) && Protocol.ALLOWED_WEAPONS.includes(event.weapon) &&
+        Array.isArray(event.lines) && event.lines.length <= 16 &&
+        event.lines.every((line) => Array.isArray(line) && line.length === 6 &&
+          line.every((n) => Number.isFinite(n) && n >= -200 && n <= 200));
+    }
+    if (event.kind === 'shield')
+      return known(event.target) && source && point(event.at) &&
+        (event.seq == null || safeCount(event.seq));
+    if (event.kind === 'damage')
+      return known(event.target) && source && Number.isFinite(event.damage) &&
+        event.damage >= 0 && event.damage <= 500 && typeof event.head === 'boolean' &&
+        point(event.at) && (event.seq == null || safeCount(event.seq));
+    if (event.kind === 'kill')
+      return known(event.target) && source && safeCount(event.streak);
+    if (event.kind === 'respawn')
+      return known(event.actor) && point(event.at) &&
+        Number.isSafeInteger(event.color) && event.color >= 0 && event.color <= 0xffffff;
+    return known(event.winner);
+  }
+
+  function validCheckpoint(message) {
+    if (!Number.isSafeInteger(message.tick) || message.tick < 0 ||
+        !Number.isFinite(message.time) || message.time < 0 ||
+        message.time > 100_000_000 ||
+        !Number.isSafeInteger(message.manifestVersion) ||
+        message.manifestVersion < 1 ||
+        !Array.isArray(message.actors) || message.actors.length < 1 ||
+        message.actors.length > 16 ||
+        !Array.isArray(message.events) || message.events.length > 128) return false;
+
+    const actorIds = new Set();
+    for (const actor of message.actors) {
+      if (!actor || typeof actor !== 'object' || Array.isArray(actor) ||
+          typeof actor.netId !== 'string' || !actor.netId ||
+          actor.netId.length > 80 || actorIds.has(actor.netId) ||
+          !CHECKPOINT_CONTROLLERS.has(actor.controller) ||
+          typeof actor.human !== 'boolean' ||
+          (actor.human ? actor.controller === 'bot' : actor.controller !== 'bot') ||
+          !CHECKPOINT_SKILLS.has(actor.skill) ||
+          !actor.ammoBy || typeof actor.ammoBy !== 'object' ||
+          Array.isArray(actor.ammoBy)) return false;
+      const weapons = Object.keys(actor.ammoBy);
+      if (weapons.length > Protocol.ALLOWED_WEAPONS.length ||
+          weapons.some((weapon) => !Protocol.ALLOWED_WEAPONS.includes(weapon))) return false;
+      for (const weapon of weapons) {
+        const ammo = actor.ammoBy[weapon];
+        if (!Array.isArray(ammo) || ammo.length !== 2 ||
+            !safeCount(ammo[0]) || !safeCount(ammo[1])) return false;
+      }
+      actorIds.add(actor.netId);
+    }
+    return message.events.every((event) => validCheckpointEvent(event, actorIds));
+  }
+
+  /* Every room that opted in to listing, whether or not you can walk into it
+     right now. Hiding running rooms made the browser read "no open rooms" at
+     exactly the times the game had the most people in it, so a match in
+     progress is advertised as unjoinable rather than left out — the population
+     is the point, not just the vacancies.
+
+     Joinable rooms are emitted first so a busy relay spends the list budget on
+     seats you can take before it spends it on scenery. */
+  function listedRooms() {
+    const open = [];
+    const running = [];
+
+    for (const room of rooms.values()) {
+      if (!room.listed || !room.host) continue;
+
+      const summary = {
+        code: room.code,
+        host: room.host.name,
+        players: room.members.size,
+        max: Protocol.MAX_PLAYERS,
+        inProgress: room.started
+      };
+
+      if (room.started) running.push(summary);
+      else if (room.members.size < Protocol.MAX_PLAYERS) open.push(summary);
+    }
+
+    return open.concat(running).slice(0, maxListedRooms);
+  }
+
+  const accountStore = options.accountStore || null;
+
+  /* A browser WebSocket cannot attach an Authorization header, so the same
+     bearer credential used by the account HTTP API travels once in the room
+     handshake. It is optional and a bad or expired value is signed-out state,
+     not a failed game connection. Most importantly, the returned set comes
+     from the database rather than from either cosmetic claim. Paid
+     entitlements and active earned claims remain separate records;
+     ownedCosmeticIds unions them only for this gate. */
+  function approvedIdentity(message) {
+    const declared = Protocol.sanitizeCosmetics(
+      message && message.cosmetics,
+      catalogAcceptsCosmetic
+    );
+    const token = message && message.authToken;
+    let ownedCosmetics = [];
+    let userId = null;
+    if (accountStore && accountStore.auth &&
+        typeof accountStore.auth.authenticate === 'function' &&
+        typeof token === 'string' && /^[A-Za-z0-9_-]{20,512}$/.test(token)) {
+      try {
+        const account = accountStore.auth.authenticate({
+          authorization: `Bearer ${token}`
+        }, false);
+        if (account && Array.isArray(account.entitlements)) {
+          userId = account.userId;
+          ownedCosmetics = typeof accountStore.ownedCosmeticIds === 'function'
+            ? accountStore.ownedCosmeticIds(account)
+            : account.entitlements;
+        }
+      } catch (error) {
+        /* Authentication is deliberately fail-closed for appearance and
+           fail-open for play: the peer keeps its seat, wearing the default. */
+      }
+    }
+    const owned = new Set(ownedCosmetics);
+    return {
+      userId,
+      cosmetics: Protocol.sanitizeCosmetics(
+        declared,
+        (id, kind, slot) => owned.has(id) && catalogAcceptsCosmetic(id, kind, slot)
+      )
+    };
+  }
+
+  function snapshotWithApprovedCosmetics(room, message) {
+    const actors = message.actors.map((actor) => {
+      if (!actor || typeof actor !== 'object' || Array.isArray(actor)) return actor;
+      const member = typeof actor.netId === 'string'
+        ? room.members.get(actor.netId)
+        : null;
+      const cosmetics = member
+        ? Protocol.sanitizeCosmetics(member.cosmetics, catalogAcceptsCosmetic)
+        : Protocol.sanitizeCosmetics(null);
+      const clean = { ...actor };
+      /* The relay authors this field from the room member, even when the host
+         omitted or forged it. A bot has no member and therefore no cosmetic;
+         netId remains the manifest identity on both paths. */
+      if (Protocol.hasCosmetics(cosmetics)) clean.cosmetics = cosmetics;
+      else delete clean.cosmetics;
+      return clean;
+    });
+    return { ...message, actors };
+  }
+
+  function adminAuthorized(request) {
+    const value = request && request.headers && request.headers.authorization;
+    if (typeof value !== 'string' || !value.startsWith('Bearer ')) return false;
+    const supplied = Buffer.from(value.slice(7), 'utf8');
+    const expected = Buffer.from(adminToken, 'utf8');
+    return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+  }
+
+  function publicPeer(peer) {
+    return {
+      id: peer.id,
+      name: peer.name,
+      room: peer.room.code,
+      ...(peer.room.rules === 'duel' ? { rules: 'duel' } : {}),
+      role: peer.role,
+      slot: peer.slot,
+      signedIn: !!peer.userId,
+      network: bans.networkFingerprint(peer.address)
+    };
+  }
+
+  function onlinePeers() {
+    return Array.from(peers.values())
+      .filter((peer) => peer.room)
+      .sort((a, b) => a.room.code.localeCompare(b.room.code) ||
+        a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+  }
+
+  function selectPeer(selector) {
+    const wanted = typeof selector === 'string' ? selector.trim() : '';
+    if (!wanted || wanted.length > 100)
+      throw new HttpError(400, 'invalid_selector', 'Provide a player name or peer id.');
+    const players = onlinePeers();
+    const exactId = players.filter((peer) => peer.id === wanted);
+    if (exactId.length === 1) return exactId[0];
+    const folded = wanted.toLocaleLowerCase('en-US');
+    const exactName = players.filter((peer) =>
+      peer.name.toLocaleLowerCase('en-US') === folded
+    );
+    if (exactName.length === 1) return exactName[0];
+    if (exactName.length > 1) {
+      const error = new HttpError(409, 'ambiguous_player',
+        'More than one online player has that name; use the peer id.');
+      error.candidates = exactName.map(publicPeer);
+      throw error;
+    }
+    const byPrefix = wanted.length >= 4
+      ? players.filter((peer) => peer.id.startsWith(wanted))
+      : [];
+    if (byPrefix.length === 1) return byPrefix[0];
+    if (byPrefix.length > 1) {
+      const error = new HttpError(409, 'ambiguous_player',
+        'That peer-id prefix matches more than one player; use more characters.');
+      error.candidates = byPrefix.map(publicPeer);
+      throw error;
+    }
+    throw new HttpError(404, 'player_not_found', 'No matching player is online.');
+  }
+
+  function disconnectByOperator(peer, action, reason) {
+    const description = describePeer(peer);
+    const roomCode = peer.room && peer.room.code;
+    peer.moderated = true;
+    const message = action === 'banned'
+      ? 'Banned by the server operator.'
+      : 'Removed by the server operator.';
+    sendError(peer, action, message);
+    console.warn(`Admin ${action}: ${description} from room ${roomCode}` +
+      (reason ? ` (${reason})` : ''));
+    try { peer.ws.close(1008, action); }
+    catch (error) { peer.ws.terminate(); }
+  }
+
+  async function handleAdminHttp(request, response, pathname) {
+    if (pathname !== '/admin' && !pathname.startsWith('/admin/')) return false;
+    if (!adminToken) {
+      sendJson(response, 404, { error: 'not_found', message: 'Not found.' });
+      return true;
+    }
+    if (!adminAuthorized(request)) {
+      sendJson(response, 401, { error: 'unauthorized', message: 'Invalid admin token.' }, {
+        'www-authenticate': 'Bearer'
+      });
+      return true;
+    }
+
+    try {
+      if (request.method === 'GET' && pathname === '/admin/players') {
+        sendJson(response, 200, { players: onlinePeers().map(publicPeer) });
+        return true;
+      }
+      if (request.method === 'GET' && pathname === '/admin/bans') {
+        sendJson(response, 200, { bans: bans.list() });
+        return true;
+      }
+      if (request.method === 'POST' &&
+          (pathname === '/admin/kick' || pathname === '/admin/ban')) {
+        const body = await readJsonBody(request, 4096);
+        const peer = selectPeer(body.selector);
+        const reason = typeof body.reason === 'string'
+          ? body.reason.trim().replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200)
+          : '';
+        const player = publicPeer(peer);
+        let result = null;
+        if (pathname === '/admin/ban') {
+          try {
+            result = bans.add(peer, reason);
+          } catch (error) {
+            throw new HttpError(500, 'ban_store_failed',
+              `The ban was not saved: ${error.message}`);
+          }
+        }
+        sendJson(response, 200, {
+          player,
+          ...(result ? { ban: result.ban, created: result.created } : {})
+        });
+        disconnectByOperator(peer, pathname === '/admin/ban' ? 'banned' : 'kicked', reason);
+        return true;
+      }
+      if (request.method === 'POST' && pathname === '/admin/unban') {
+        const body = await readJsonBody(request, 4096);
+        let result;
+        try {
+          result = bans.remove(body.selector);
+        } catch (error) {
+          throw new HttpError(500, 'ban_store_failed',
+            `The ban was not removed: ${error.message}`);
+        }
+        if (result.status === 'missing')
+          throw new HttpError(404, 'ban_not_found', 'No matching ban exists.');
+        if (result.status === 'ambiguous') {
+          const error = new HttpError(409, 'ambiguous_ban',
+            'That ban-id prefix matches more than one ban; use more characters.');
+          error.matches = result.matches;
+          throw error;
+        }
+        sendJson(response, 200, { ban: result.ban });
+        console.warn(`Admin unbanned: ${result.ban.name || result.ban.id} (${result.ban.id})`);
+        return true;
+      }
+      sendJson(response, 404, { error: 'not_found', message: 'Admin route not found.' });
+      return true;
+    } catch (error) {
+      const status = error instanceof HttpError ? error.status : 500;
+      sendJson(response, status, {
+        error: error instanceof HttpError ? error.code : 'internal_error',
+        message: error instanceof HttpError ? error.message : 'Internal server error.',
+        ...(Array.isArray(error.candidates) ? { candidates: error.candidates } : {}),
+        ...(Array.isArray(error.matches) ? { matches: error.matches } : {})
+      });
+      return true;
+    }
+  }
+
+  async function handleHttp(request, response) {
+    let requestUrl;
+    let pathname;
+    try {
+      requestUrl = new URL(request.url || '/', 'http://localhost');
+      pathname = requestUrl.pathname;
+    } catch (error) {
+      response.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+      response.end('Bad request\n');
+      return;
+    }
+
+    if (pathname.startsWith('/vendor/')) {
+      const vendor = pathname.startsWith('/vendor/hands/') ? resolve(ROOT_DIR,'node_modules/@mediapipe/hands',pathname.slice(14)) : pathname.startsWith('/vendor/camera_utils/') ? resolve(ROOT_DIR,'node_modules/@mediapipe/camera_utils',pathname.slice(21)) : pathname==='/vendor/three.min.js' ? resolve(ROOT_DIR,'node_modules/three/build/three.min.js') : null;
+      if(vendor && !pathname.includes('..')){try{const body=await readFile(vendor);response.writeHead(200,{'content-type':vendor.endsWith('.js')?'application/javascript':vendor.endsWith('.wasm')?'application/wasm':'application/octet-stream'});response.end(body);}catch{response.writeHead(404);response.end();}return;}
+    }
+    if (await handleAdminHttp(request, response, pathname)) return;
+
+    if (accountStore && await accountStore.handleHttp(request, response, requestUrl))
+      return;
+
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      response.writeHead(405, {
+        allow: 'GET, HEAD',
+        'content-type': 'text/plain; charset=utf-8'
+      });
+      response.end('Method not allowed\n');
+      return;
+    }
+
+    /* The room browser is public, read-only data, and the page is often
+       opened straight off disk (file://), which makes this request
+       cross-origin. Allow it explicitly and never cache it. */
+    if (pathname === '/rooms') {
+      /* Solo play never opens a socket, so this is the multiplayer population.
+         Count only peers that finished the handshake and landed in a room —
+         peers.size would also include the up-to-joinTimeoutMs window that
+         scanners and abandoned tabs sit in, inflating the number. */
+      let online = 0;
+      for (const peer of peers.values()) if (peer.room) online++;
+      const body = Buffer.from(
+        JSON.stringify({ rooms: listedRooms(), online, matches: matchesPlayed }),
+        'utf8'
+      );
+      /* Mirror the socket's policy: wide open when unconfigured, otherwise
+         only the origins that are allowed to play here. */
+      const origin = request.headers.origin;
+      const shareWith = allowedOrigins.size === 0
+        ? '*'
+        : (originAllowed(request) ? origin : null);
+      response.writeHead(200, {
+        ...(shareWith ? { 'access-control-allow-origin': shareWith, vary: 'Origin' } : {}),
+        'cache-control': 'no-store',
+        'content-length': body.byteLength,
+        'content-type': 'application/json; charset=utf-8',
+        'x-content-type-options': 'nosniff'
+      });
+      response.end(request.method === 'HEAD' ? undefined : body);
+      return;
+    }
+
+    let filePath;
+    let contentType;
+    if (pathname === '/' || pathname === '/index.html') {
+      filePath = indexPath;
+      contentType = 'text/html; charset=utf-8';
+    } else if (pathname === '/controller') {
+      /* Browser phone controller (pairing code): same laptop server, same
+         LAN trust as the game page itself. */
+      filePath = browserControllerPath;
+      contentType = 'text/html; charset=utf-8';
+    } else if (pathname === '/gyro-controller') {
+      /* Legacy browser gyro page for the /gyro relay protocol (the native
+         Android controller app speaks the same protocol). */
+      filePath = controllerPath;
+      contentType = 'text/html; charset=utf-8';
+    } else if (pathname === '/net-protocol.js') {
+      filePath = protocolPath;
+      contentType = 'text/javascript; charset=utf-8';
+    } else {
+      response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      response.end('Not found\n');
+      return;
+    }
+
+    try {
+      const body = await readFile(filePath);
+      response.writeHead(200, {
+        'cache-control': 'no-cache',
+        'content-length': body.byteLength,
+        'content-type': contentType,
+        'x-content-type-options': 'nosniff'
+      });
+      response.end(request.method === 'HEAD' ? undefined : body);
+    } catch (error) {
+      response.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
+      response.end('Unable to load game\n');
+    }
+  }
+
+  const createServer = options.tls ? (handler => createHttpsServer(options.tls,handler)) : createHttpServer;
+  const server = createServer((request, response) => {
+    handleHttp(request, response).catch(() => {
+      if (!response.headersSent) {
+        response.writeHead(500, {
+          'content-type': 'text/plain; charset=utf-8'
+        });
+      }
+      response.end('Internal server error\n');
+    });
+  });
+
+  const wss = new WebSocketServer({
+    clientTracking: false,
+    maxPayload: maxMessageBytes,
+    noServer: true,
+    perMessageDeflate: false
+  });
+
+  /* Phone gyro controller relay: one game page (role=game) and one phone
+     (role=phone) per server. Phone messages forward to the game verbatim;
+     the game page validates shape. Local LAN only, tiny payloads, no rooms,
+     no state -- a newest-connection-wins pipe. */
+  const gyroWss = new WebSocketServer({
+    clientTracking: false,
+    maxPayload: 4096,
+    noServer: true,
+    perMessageDeflate: false
+  });
+  /* Pairing is per CODE: each laptop's game page shows a 4-letter code and
+     connects with ?role=game&code=XXXX; the phone app types that code and
+     connects with ?role=phone&code=XXXX. Two laptops on one server get two
+     isolated pairs. A missing/invalid code falls back to the legacy shared
+     pair ('default') so the original hotspot flow still works. */
+  const gyroPairs = new Map();
+  /* The phone gets told the pair state explicitly: a socket that reached the
+     server is not the same thing as a laptop actually listening on this code,
+     and without this message the two looked identical on the phone. Sent on
+     every join and every leave; phones that predate it simply ignore it. */
+  const gyroTellPhone = (pair) => {
+    if (!pair.phone || pair.phone.readyState !== WebSocket.OPEN) return;
+    const on = !!(pair.game && pair.game.readyState === WebSocket.OPEN);
+    try { pair.phone.send(JSON.stringify({ t: 'paired', on })); } catch {}
+  };
+  gyroWss.on('connection', (ws, request) => {
+    let role, code;
+    try {
+      const q = new URL(request.url || '', 'http://localhost').searchParams;
+      role = q.get('role');
+      code = (q.get('code') || '').toUpperCase();
+    } catch { role = null; code = ''; }
+    if (!/^[A-Z0-9]{4,8}$/.test(code)) code = 'default';
+    const isGame = role === 'game';
+    let pair = gyroPairs.get(code);
+    if (!pair) { pair = { game: null, phone: null }; gyroPairs.set(code, pair); }
+    const prev = isGame ? pair.game : pair.phone;
+    if (prev && prev !== ws && prev.readyState === WebSocket.OPEN) prev.terminate();
+    if (isGame) pair.game = ws; else pair.phone = ws;
+    /* Phone fire/aim failures are otherwise invisible: the relay is verbatim,
+       so a phone paired with no laptop listening (or the reverse) looked
+       exactly like a working pair from either screen. */
+    console.log(`Gyro: ${isGame ? 'game' : 'phone'} joined code ${code}` +
+      ` (game=${!!pair.game} phone=${!!pair.phone})`);
+    gyroTellPhone(pair);
+    ws.on('message', (data) => {
+      const target = isGame ? pair.phone : pair.game;
+      if (target && target.readyState === WebSocket.OPEN) target.send(data.toString());
+    });
+    ws.on('close', () => {
+      if (isGame && pair.game === ws) pair.game = null;
+      if (!isGame && pair.phone === ws) pair.phone = null;
+      if (!pair.game && !pair.phone) gyroPairs.delete(code);
+      else gyroTellPhone(pair);
+      console.log(`Gyro: ${isGame ? 'game' : 'phone'} left code ${code}`);
+    });
+    ws.on('error', () => {});
+  });
+
+  function sendEncoded(peer, encoded, isSnapshot = false) {
+    if (!peer || encoded === null || peer.ws.readyState !== WebSocket.OPEN) return false;
+    if (peer.ws.bufferedAmount > hardBackpressureBytes) {
+      peer.ws.terminate();
+      return false;
+    }
+    if (isSnapshot && peer.ws.bufferedAmount > backpressureBytes) return false;
+
+    try {
+      peer.ws.send(encoded);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function send(peer, message, isSnapshot = false) {
+    return sendEncoded(peer, encode(message), isSnapshot);
+  }
+
+  /* Leaves an outstanding measurement alone rather than restamping it: the
+     pong that answers the first ping is the one that carries the honest round
+     trip, and a second stamp on top of it would report the gap between the
+     pings instead. */
+  function pingPeer(peer) {
+    if (!peer || peer.ws.readyState !== WebSocket.OPEN) return;
+    if (peer.pingAt === 0) peer.pingAt = Date.now();
+    try {
+      peer.ws.ping();
+    } catch (error) {
+      peer.ws.terminate();
+    }
+  }
+
+  function sendError(peer, code, message) {
+    send(peer, {
+      t: 'error',
+      v: Protocol.VERSION,
+      code,
+      message
+    });
+  }
+
+  function broadcastMembers(room) {
+    const encoded = encode({
+      t: 'members',
+      v: Protocol.VERSION,
+      members: memberList(room),
+      /* What a round starting now would be played on, so the lobby can say so
+         instead of leaving the swap to be discovered at the whistle. A
+         forecast rather than a promise: it is computed from the roster, and
+         the roster is exactly what changes between here and the start, which
+         is why it rides the roster message and is recomputed every time.
+         Withheld mid-round, where the only honest answer is the map already
+         being played. */
+      nextMap: room.started ? null : upcomingMap(room),
+      autoStartIn: autoStartRemaining(room)
+    });
+
+    for (const peer of room.members.values()) {
+      sendEncoded(peer, encoded);
+    }
+  }
+
+  /* ---- automatic start ---------------------------------------------------
+
+     A lobby waits on a clock rather than on a person. The clock is here and
+     not in the host's page because the host who needs it most is the one who
+     stopped looking at their page, and a browser that is not being looked at
+     is a browser whose timers have been throttled to a crawl or stopped
+     outright. Every room therefore starts itself, and START MATCH is left for
+     the impatient. */
+
+  function autoStartEligible(room) {
+    return room.rules !== 'duel' && autoStartMs > 0 && !room.started && !room.migrating &&
+      !!room.host && room.members.size >= 2;
+  }
+
+  function clearAutoStart(room) {
+    if (room.autoStartTimer) clearTimeout(room.autoStartTimer);
+    room.autoStartTimer = null;
+    room.autoStartAt = 0;
+    /* Holds are spent per wait, not per room: every fresh clock — a new round,
+       a rebuilt roster — is a fresh case for keeping a seat open. */
+    room.autoStartHolds = 0;
+  }
+
+  /* The deadline outlives the timer that watches it, so a roster change re-arms
+     without moving the moment: the number already counting down on four screens
+     must not jump back up because a fifth person opened the door. */
+  function scheduleAutoStart(room) {
+    if (!autoStartEligible(room)) {
+      clearAutoStart(room);
+      return;
+    }
+    if (!room.autoStartAt) {
+      room.autoStartAt = Date.now() +
+        (room.round > 0 ? autoStartRematchMs : autoStartMs);
+    }
+    if (room.autoStartTimer) clearTimeout(room.autoStartTimer);
+    room.autoStartTimer = setTimeout(() => {
+      room.autoStartTimer = null;
+      if (!autoStartEligible(room)) return;
+      /* Nothing here asks the host first, and nothing waits for it to answer.
+         If its page is asleep the round begins without it and the snapshot
+         watchdog hands authority to somebody awake a couple of seconds later,
+         which is a match starting late rather than a room never starting. */
+      startRound(room);
+    }, Math.max(0, room.autoStartAt - Date.now()));
+    if (typeof room.autoStartTimer.unref === 'function') room.autoStartTimer.unref();
+  }
+
+  /* Milliseconds left, or null for a room that is not counting. Sent with the
+     roster so every client — guests included — can show the same clock instead
+     of watching a roster that never moves and hoping. */
+  function autoStartRemaining(room) {
+    if (!room.autoStartTimer || !room.autoStartAt) return null;
+    return Math.max(0, room.autoStartAt - Date.now());
+  }
+
+  /* ---- map rotation ------------------------------------------------------
+
+     Between rounds the room moves to the next map, the way a solo session
+     already does. The relay announces it because the relay is what starts
+     rounds: a host whose page is asleep gets started without, and a room
+     whose map could only move when its host was awake would sit on one map
+     for exactly the hosts least likely to notice.
+
+     The order is the host's announced catalog, in the order it sent it. The
+     relay still never learns what a map *is* — it walks a list of opaque ids
+     and checks that everyone here claimed the one it lands on — so a page
+     that adds a third map rotates through it with no relay deploy at all. */
+  function everyMemberSupports(room, id) {
+    for (const member of room.members.values())
+      if (!member.supportedMaps.includes(id)) return false;
+    return true;
+  }
+
+  /* The map the next round will use. Before the first round that is simply
+     the map the room was created on: rotation is what happens *between*
+     rounds, and nobody has played anything yet. */
+  function upcomingMap(room) {
+    if (room.round < 1) return room.map;
+    const pool = room.host ? room.host.supportedMaps : [];
+    const at = pool.indexOf(room.map);
+    /* A host that cannot build the room's own map is a migration that should
+       not have happened, not a rotation decision. Leave the room where it is
+       and let the round start; the snapshot checks will speak up if it is
+       really wrong. */
+    if (at === -1) return room.map;
+    /* Stops one short of a lap, so the answer is never the map already up and
+       a pool of one never rotates. Skipping a map nobody else can build keeps
+       a room playable with mixed pages rather than dropping whoever is
+       behind — the rotation is not worth a player. */
+    for (let step = 1; step < pool.length; step++) {
+      const candidate = pool[(at + step) % pool.length];
+      if (everyMemberSupports(room, candidate)) return candidate;
+    }
+    return room.map;
+  }
+
+  function startRound(room) {
+    clearAutoStart(room);
+    /* Before the round number moves, and never once it has: room.map is what
+       every snapshot in the round about to start is measured against, here
+       and on every page in the room. */
+    room.map = upcomingMap(room);
+    room.started = true;
+    room.round++;
+    room.latestSnapshot = null;
+    room.latestCheckpoint = null;
+    room.snapshotAt = 0;
+    room.snapshotIntervalMs = 0;
+    room.matchId = String(makeMatchId());
+    room.battlePassStartedAt = relayNow();
+    room.battlePassSnapshotCount = 0;
+    room.battlePassLastCountedSnapshotBucket = -1;
+    room.battlePassParticipants = new Set(
+      Array.from(room.members.values(), (member) => member.userId).filter(Boolean)
+    );
+    armSnapshotStall(room, room.host, authorityGraceMs);
+    /* A round starting is a fresh slate for everyone: time spent waiting in
+       the lobby is not time spent away from a match. */
+    for (const member of room.members.values()) {
+      member.lastSeq = -1;
+      member.activeAt = Date.now();
+      resetAimWindow(member);
+      /* The heartbeat is on a half-minute clock, which is a long time to spend
+         at the start of a match with no latency figure for the host to bound a
+         rewind with. One ping each at the whistle costs a frame of nothing and
+         means the number is there for the first firefight. */
+      pingPeer(member);
+    }
+    broadcastRoom(room, {
+      t: 'start',
+      v: Protocol.VERSION,
+      authorityEpoch: room.authorityEpoch,
+      round: room.round,
+      ...(room.rules === 'duel' ? { rules: 'duel' } : {}),
+      map: room.map,
+      members: memberList(room)
+    }, true);
+  }
+
+  function broadcastRoom(room, message, includeHost = false) {
+    const encoded = encode(message);
+    if (encoded === null) return false;
+    const isSnapshot = message.t === 'snapshot';
+
+    for (const peer of room.members.values()) {
+      if (includeHost || peer.role === 'guest') sendEncoded(peer, encoded, isSnapshot);
+    }
+    return true;
+  }
+
+  function consumeRateToken(peer) {
+    const now = Date.now();
+    const elapsedSeconds = Math.max(0, now - peer.rateUpdatedAt) / 1000;
+    peer.rateUpdatedAt = now;
+    peer.rateTokens = Math.min(
+      rateBurst,
+      peer.rateTokens + elapsedSeconds * ratePerSecond
+    );
+
+    if (peer.rateTokens < 1) return false;
+    peer.rateTokens -= 1;
+    return true;
+  }
+
+  function reserveRoomCode() {
+    for (let attempt = 0; attempt < 128; attempt++) {
+      const code = Protocol.createRoomCode(roomRandom);
+      if (!rooms.has(code)) return code;
+    }
+    return null;
+  }
+
+  /* Every line the relay writes about a peer names it the same way, so a burst
+     of aim warnings and the join and the leave around it read as one session
+     rather than three unrelated facts. That is the whole point: a single
+     window over the aim limit says nothing until you can see whether its owner
+     played on afterwards or vanished in the same second.
+
+     The name is the player's own text, but cleanPlayerName has already
+     replaced every control character in it, so nothing here can forge a line
+     of its own. */
+  function describePeer(peer) {
+    /* The head of the id rather than all 36 characters of it: this goes on
+       every join, leave and aim warning, and it only has to tell one peer from
+       the eight others that can be in a room with it. */
+    return `"${peer.name}" (${peer.id.slice(0, 8)}, seat ${peer.slot})`;
+  }
+
+  function enterRoom(peer, room, role, name, identity, supportedMaps) {
+    if (peer.joinTimer) clearTimeout(peer.joinTimer);
+    peer.joinTimer = null;
+    peer.name = name;
+    peer.role = role;
+    peer.room = room;
+    peer.slot = claimSlot(room);
+    peer.userId = identity.userId;
+    peer.cosmetics = Protocol.sanitizeCosmetics(identity.cosmetics, catalogAcceptsCosmetic);
+    /* Kept in the order the page sent it rather than as a set, because for the
+       host that order is the rotation — see upcomingMap(). */
+    peer.supportedMaps = supportedMaps.slice();
+    peer.lastSeq = -1;
+    /* Arriving is activity. A drop-in gets the full grace period to find the
+       deploy card, and nobody is judged on time spent before they were here. */
+    peer.activeAt = Date.now();
+    room.members.set(peer.id, peer);
+    if (role === 'host') room.host = peer;
+    console.log(`Join: ${describePeer(peer)} as ${role} in room ${room.code}`);
+    /* Here rather than at connect: this is the point a peer has cleared the
+       handshake and taken a seat, so scanners and abandoned tabs never land in
+       the total. Host migration reuses the peers already counted — it does not
+       come back through here. */
+    countMatchPlayed();
+  }
+
+  function rejectBannedIdentity(peer, name, identity) {
+    const ban = bans.match({ userId: identity.userId, address: peer.address });
+    if (!ban) return false;
+    peer.moderated = true;
+    sendError(peer, 'banned', 'Banned by the server operator.');
+    console.warn(`Rejected banned player "${name}" (${peer.id.slice(0, 8)})`);
+    try { peer.ws.close(1008, 'banned'); }
+    catch (error) { peer.ws.terminate(); }
+    return true;
+  }
+
+  /* The round is part of the handshake, not just of `start`. A player who
+     joins a room that has already run a round starts from that room's round,
+     so the next `start` they see is the expected step forward. Without this a
+     late joiner sits in the lobby ignoring every start it is sent.
+
+     `started` is the same idea one step further: it tells a peer arriving
+     mid-round to walk into the match rather than wait in a lobby for a start
+     that already happened. The relay sends no world state with it — the host
+     seats the arrival on the next roster broadcast and the existing snapshot
+     stream carries the world, which is why drop-in needs no new message. */
+  function roomReply(peer) {
+    send(peer, {
+      t: 'room',
+      v: Protocol.VERSION,
+      room: peer.room.code,
+      ...(peer.room.rules === 'duel' ? { rules: 'duel' } : {}),
+      id: peer.id,
+      role: peer.role,
+      authorityEpoch: peer.room.authorityEpoch,
+      round: peer.room.round,
+      map: peer.room.map,
+      started: peer.room.started,
+      members: memberList(peer.room),
+      autoStartIn: autoStartRemaining(peer.room)
+    });
+  }
+
+  function handleCreate(peer, message) {
+    const name = Protocol.cleanPlayerName(message.name);
+    if (!name) {
+      sendError(peer, 'invalid-name', 'Choose a player name.');
+      return;
+    }
+    const supportedMaps = Protocol.cleanMapIds(message.maps);
+    const map = Protocol.cleanMapId(
+      message.map,
+      (id) => supportedMaps.includes(id)
+    );
+    if (!map) {
+      sendError(peer, 'invalid-map', 'Choose a supported map before creating a room.');
+      return;
+    }
+    const identity = approvedIdentity(message);
+    if (rejectBannedIdentity(peer, name, identity)) return;
+    if (rooms.size >= maxRooms) {
+      sendError(peer, 'server-full', 'The room server is full.');
+      return;
+    }
+
+    const code = reserveRoomCode();
+    if (!code) {
+      sendError(peer, 'room-code-exhausted', 'Unable to create a room.');
+      return;
+    }
+
+    const room = {
+      code,
+      rules: message.rules === 'duel' ? 'duel' : 'standard',
+      map,
+      host: null,
+      members: new Map(),
+      started: false,
+      round: 0,
+      authorityEpoch: 1,
+      latestSnapshot: null,
+      latestCheckpoint: null,
+      matchId: null,
+      battlePassStartedAt: 0,
+      battlePassSnapshotCount: 0,
+      battlePassLastCountedSnapshotBucket: -1,
+      battlePassParticipants: new Set(),
+      migrating: null,
+      snapshotAt: 0,
+      snapshotIntervalMs: 0,
+      snapshotStallTimer: null,
+      autoStartTimer: null,
+      autoStartAt: 0,
+      autoStartHolds: 0,
+      /* Listed by default so the room browser is useful out of the box;
+         a host that wants the old code-only privacy sends listed:false. */
+      listed: message.rules !== 'duel' && message.listed !== false
+    };
+    rooms.set(code, room);
+    enterRoom(peer, room, 'host', name, identity, supportedMaps);
+    roomReply(peer);
+    broadcastMembers(room);
+  }
+
+  function handleJoin(peer, message) {
+    const name = Protocol.cleanPlayerName(message.name);
+    if (!name) {
+      sendError(peer, 'invalid-name', 'Choose a player name.');
+      return;
+    }
+    const supportedMaps = Protocol.cleanMapIds(message.maps);
+    if (!supportedMaps.length) {
+      sendError(peer, 'invalid-map', 'This page did not provide a valid map catalog. Reload it.');
+      return;
+    }
+    const identity = approvedIdentity(message);
+    if (rejectBannedIdentity(peer, name, identity)) return;
+
+    const code = Protocol.normalizeRoomCode(message.room);
+    const room = rooms.get(code);
+    if (!room) {
+      sendError(peer, 'room-not-found', 'That room does not exist.');
+      return;
+    }
+    if (!supportedMaps.includes(room.map)) {
+      sendError(peer, 'unsupported-map',
+        'This page does not support the map used by that room. Reload it to continue.');
+      return;
+    }
+    /* A started room is joinable now. The one state that is not is a room
+       changing host: the migration is waiting on state from a known set of
+       guests, and a peer that was not in that set when it began has nothing
+       to contribute and no world to be handed. It resolves in well under a
+       second, so this is "try again", not "go away". */
+    if (room.migrating) {
+      sendError(peer, 'room-migrating', 'That room is changing host. Try again in a moment.');
+      return;
+    }
+    if (room.rules === 'duel' && room.started) {
+      sendError(peer, 'room-full', 'This 1v1 round is running. Wait for the next pair.');
+      return;
+    }
+    if (room.members.size >= (room.rules === 'duel' ? 2 : Protocol.MAX_PLAYERS)) {
+      sendError(peer, 'room-full', 'That room is full.');
+      return;
+    }
+
+    enterRoom(peer, room, 'guest', name, identity, supportedMaps);
+    /* Before either reply: the arrival is the second body that starts the
+       clock, and both messages are meant to carry the clock's answer. */
+    scheduleAutoStart(room);
+    roomReply(peer);
+    broadcastMembers(room);
+  }
+
+  /* Shortest turn between two angles, so a yaw that wrapped past PI reads as
+     the small movement it was rather than a full lap. */
+  function angleGap(a, b) {
+    let gap = (a - b) % (Math.PI * 2);
+    if (gap > Math.PI) gap -= Math.PI * 2;
+    if (gap < -Math.PI) gap += Math.PI * 2;
+    return Math.abs(gap);
+  }
+
+  /* Away-from-keyboard is a question about the player, not the socket: an idle
+     client still sends input sixty times a second, it is just the same input
+     every time. So the test is what the input says, not that it arrived.
+
+     Looking around counts. Someone turning to watch a firefight is present,
+     and the epsilon is only there to ignore the last hair of the client's own
+     aim damping settling to a stop. */
+  const AIM_EPSILON = 0.005;
+  function inputShowsAPlayer(peer, input) {
+    if (input.fwd !== 0 || input.strafe !== 0 || input.jump || input.fire) return true;
+    if (input.fireSeq !== peer.lastFireSeq ||
+        input.weaponSeq !== peer.lastWeaponSeq ||
+        input.reloadSeq !== peer.lastReloadSeq) return true;
+    return angleGap(input.yaw, peer.lastYaw) > AIM_EPSILON ||
+      Math.abs(input.pitch - peer.lastPitch) > AIM_EPSILON;
+  }
+
+  function resetAimWindow(peer) {
+    peer.aimSeq = -1;
+    peer.aimTravel = 0;
+  }
+
+  /* Aim is the one thing a guest sends that the relay cannot check against the
+     world: it has no simulation, so it cannot say whether a shot was plausible.
+     What it can say is whether the hand that aimed was a hand.
+
+     A strike is a whole window over the limit, and a clean window pays one
+     back, so this accumulates only when a guest is over the line more often
+     than under it. One frantic moment never adds up to anything. */
+  function trackAimRate(peer, input) {
+    if (aimRateLimit <= 0) return true;
+
+    if (peer.aimSeq < 0 || input.seq <= peer.aimSeq) {
+      resetAimWindow(peer);
+      peer.aimSeq = input.seq;
+      return true;
+    }
+
+    peer.aimTravel += angleGap(input.yaw, peer.lastYaw) +
+      Math.abs(input.pitch - peer.lastPitch);
+
+    const ticks = input.seq - peer.aimSeq;
+    if (ticks < aimRateWindowTicks) return true;
+
+    const rate = peer.aimTravel / (ticks / SIMULATION_HZ);
+    peer.aimSeq = input.seq;
+    peer.aimTravel = 0;
+
+    if (rate <= aimRateLimit) {
+      if (peer.aimStrikes > 0) peer.aimStrikes--;
+      return true;
+    }
+
+    peer.aimStrikes++;
+    /* Written above the gate below, so every strike is logged and not only the
+       ones that end a connection. The near misses are the reading that matters:
+       a peer that keeps reaching one strike and never three is a threshold set
+       wrong, and this line is the only thing that would ever say so. */
+    console.warn(`Aim rate ${rate.toFixed(1)} rad/s over ${aimRateLimit}: ` +
+      `${describePeer(peer)} in room ${peer.room.code} (strike ` +
+      `${peer.aimStrikes}${aimRateStrikes > 0 ? ` of ${aimRateStrikes}` : ', not enforced'})`);
+    if (aimRateStrikes <= 0 || peer.aimStrikes < aimRateStrikes) return true;
+
+    sendError(peer, 'aim-rate', 'Removed for impossible aim movement.');
+    try { peer.ws.close(1008, 'aim rate'); }
+    catch (error) { peer.ws.terminate(); }
+    return false;
+  }
+
+  function handleGuestInput(peer, message) {
+    if (!peer.room.started || peer.room.migrating ||
+        message.round !== peer.room.round ||
+        message.authorityEpoch !== peer.room.authorityEpoch) return;
+    const sanitized = Protocol.sanitizeInput(message, peer.lastSeq);
+    if (!sanitized.ok) {
+      sendError(peer, 'invalid-input', sanitized.error);
+      return;
+    }
+
+    if (idleKickMs > 0 && inputShowsAPlayer(peer, sanitized.value))
+      peer.activeAt = Date.now();
+    /* Before the aim baseline moves: the rate is measured against the previous
+       sample, which is the one still sitting in peer.lastYaw. */
+    if (!trackAimRate(peer, sanitized.value)) return;
+    peer.lastFireSeq = sanitized.value.fireSeq;
+    peer.lastWeaponSeq = sanitized.value.weaponSeq;
+    peer.lastReloadSeq = sanitized.value.reloadSeq;
+    peer.lastYaw = sanitized.value.yaw;
+    peer.lastPitch = sanitized.value.pitch;
+
+    peer.lastSeq = sanitized.value.seq;
+    /* rttMs is the relay's own measurement, not the guest's claim about
+       itself, and it is here so the host can bound how far into the past a
+       guest is allowed to ask it to rewind. A guest cannot inflate its own
+       latency to buy a longer look backwards without inflating a number it
+       does not author. Additive and ignorable: a host that does not read it
+       falls back to the protocol's flat bound. */
+    send(peer.room.host, {
+      ...sanitized.value,
+      from: peer.id,
+      rttMs: peer.rttMs
+    });
+  }
+
+  /* REPORT: a player naming somebody they think is cheating.
+
+     The relay writes it to the log and does nothing else — no kick, no
+     notification, not even a hint to the room that it happened. That is the
+     whole design and not a first step that stopped early. A report is one
+     player's opinion, it costs nothing to file, and the obvious way to abuse
+     any consequence attached to it is to lose a gunfight and press the button.
+     What the line in the journal is worth is the count across rooms: the same
+     jersey flagged by strangers who never met is a signal, and one flagged by
+     the person they just killed is Tuesday.
+
+     The accused is never told, for the same reason the aim-rate warning is not
+     broadcast: a cheater who knows which of their matches drew attention
+     learns what to hide, and a falsely accused player is handed a grudge over
+     something that had no effect on them. */
+  function handleReport(peer, message) {
+    const checked = Protocol.sanitizeReport(message);
+    if (!checked.ok) {
+      sendError(peer, 'invalid-report', checked.error);
+      return;
+    }
+
+    const target = peer.room.members.get(checked.value.target);
+    /* Bots are not in members, so "reported a bot" lands here rather than
+       needing a rule of its own. Reporting yourself is refused because it can
+       only be a client bug or somebody poking at the wire. */
+    if (!target || target === peer) {
+      sendError(peer, 'no-such-player', 'That player is not in this room.');
+      return;
+    }
+
+    /* Acknowledged either way. Silently dropping the repeat would leave the
+       button that sent it looking broken, and the reporter is not owed a
+       different answer for pressing twice than for pressing once. */
+    if (!peer.reported.has(target.id)) {
+      peer.reported.add(target.id);
+      target.reporters.add(peer.id);
+      console.warn(`Report: ${describePeer(peer)} reported ${describePeer(target)} ` +
+        `in room ${peer.room.code} (${target.reporters.size} ` +
+        `${target.reporters.size === 1 ? 'reporter' : 'reporters'} this session)`);
+    }
+
+    send(peer, {
+      t: 'reported',
+      v: Protocol.VERSION,
+      target: target.id
+    });
+  }
+
+  function hasCurrentAuthority(peer, message) {
+    if (message.authorityEpoch === peer.room.authorityEpoch) return true;
+    sendError(peer, 'stale-authority', 'That authority epoch is no longer active.');
+    return false;
+  }
+
+  function logBattlePassFailure(matchId, error) {
+    console.error(
+      `Unable to award battle-pass XP for match ${matchId}: ` +
+      `${error && error.stack || error}`
+    );
+  }
+
+  function logBattlePassGiveUp(matchId, attemptCount, error) {
+    console.error(
+      `Battle-pass XP for match ${matchId} needs operator attention after ` +
+      `${attemptCount} attempts: ${error && error.stack || error}`
+    );
+  }
+
+  function battlePassFallbackState() {
+    let operator = 0;
+    for (const queued of unrecordedBattlePassMatches.values())
+      if (queued.operator) operator++;
+    return {
+      queued: unrecordedBattlePassMatches.size,
+      operator,
+      dropped: droppedUnrecordedBattlePassMatches
+    };
+  }
+
+  /* This queue exists only when SQLite could not even accept the durable
+     pending row. Keep a bounded, operator-countable last resort instead of
+     retaining participant arrays without limit. If it fills, terminal entries
+     are discarded first and every discarded result remains visible in the
+     cumulative counter and error log. */
+  function queueUnrecordedBattlePassMatch(matchId, result) {
+    if (!unrecordedBattlePassMatches.has(matchId) &&
+        unrecordedBattlePassMatches.size >= maxUnrecordedBattlePassMatches) {
+      let discard = null;
+      for (const [candidateId, candidate] of unrecordedBattlePassMatches) {
+        if (candidate.operator) { discard = candidateId; break; }
+        if (discard === null) discard = candidateId;
+      }
+      if (discard !== null) {
+        unrecordedBattlePassMatches.delete(discard);
+        droppedUnrecordedBattlePassMatches++;
+        console.error(
+          `Battle-pass in-memory fallback is capped at ` +
+          `${maxUnrecordedBattlePassMatches}; discarded match ${discard}.`
+        );
+      }
+    }
+    unrecordedBattlePassMatches.set(matchId, result);
+  }
+
+  function scheduleBattlePassRetry(nextRetryAt = Date.now() + battlePassRetryMs) {
+    if (battlePassRetryTimer && battlePassRetryAt <= nextRetryAt) return;
+    if (battlePassRetryTimer) clearTimeout(battlePassRetryTimer);
+    battlePassRetryAt = nextRetryAt;
+    battlePassRetryTimer = setTimeout(() => {
+      battlePassRetryTimer = null;
+      battlePassRetryAt = null;
+      retryBattlePassAwards();
+    }, Math.max(1, nextRetryAt - Date.now()));
+    if (typeof battlePassRetryTimer.unref === 'function')
+      battlePassRetryTimer.unref();
+  }
+
+  function retryBattlePassAwards() {
+    const battlePass = accountStore && accountStore.battlePass;
+    if (!battlePass || typeof battlePass.retryPendingMatches !== 'function')
+      return { awarded: [], failures: [], deadLetters: [], nextRetryAt: null };
+    const retryOptions = {
+      retryBaseMs: battlePassRetryMs,
+      maxAttempts: battlePassMaxRetryAttempts
+    };
+    const combined = {
+      awarded: [],
+      failures: [],
+      deadLetters: [],
+      nextRetryAt: null
+    };
+    const mergeOutcome = (outcome) => {
+      combined.awarded.push(...(outcome.awarded || []));
+      combined.failures.push(...(outcome.failures || []));
+      combined.deadLetters.push(...(outcome.deadLetters || []));
+      if (Number.isFinite(outcome.nextRetryAt)) {
+        combined.nextRetryAt = combined.nextRetryAt === null
+          ? outcome.nextRetryAt
+          : Math.min(combined.nextRetryAt, outcome.nextRetryAt);
+      }
+    };
+    const retryAt = Date.now();
+    for (const [matchId, queued] of unrecordedBattlePassMatches) {
+      if (queued.operator) continue;
+      if (queued.nextAttemptAt > retryAt) {
+        combined.nextRetryAt = combined.nextRetryAt === null
+          ? queued.nextAttemptAt
+          : Math.min(combined.nextRetryAt, queued.nextAttemptAt);
+        continue;
+      }
+      try {
+        mergeOutcome(battlePass.recordMatchResult(
+          queued.matchId,
+          queued.participants,
+          queued.evidence,
+          queued.awardedAt,
+          retryOptions
+        ));
+        unrecordedBattlePassMatches.delete(matchId);
+      } catch (error) {
+        queued.attemptCount++;
+        if (queued.attemptCount >= battlePassMaxRetryAttempts) {
+          queued.operator = true;
+          logBattlePassGiveUp(matchId, queued.attemptCount, error);
+        } else {
+          const delay = Math.min(
+            BATTLE_PASS_MAX_RETRY_DELAY_MS,
+            battlePassRetryMs * (2 ** (queued.attemptCount - 1))
+          );
+          queued.nextAttemptAt = retryAt + delay;
+          combined.nextRetryAt = combined.nextRetryAt === null
+            ? queued.nextAttemptAt
+            : Math.min(combined.nextRetryAt, queued.nextAttemptAt);
+          logBattlePassFailure(matchId, error);
+        }
+      }
+    }
+    try {
+      mergeOutcome(battlePass.retryPendingMatches(retryOptions));
+    } catch (error) {
+      combined.failures.push({ matchId: '<pending>', error });
+      combined.nextRetryAt = combined.nextRetryAt === null
+        ? retryAt + battlePassRetryMs
+        : Math.min(combined.nextRetryAt, retryAt + battlePassRetryMs);
+    }
+    for (const failure of combined.failures)
+      logBattlePassFailure(failure.matchId, failure.error);
+    for (const deadLetter of combined.deadLetters) {
+      logBattlePassGiveUp(
+        deadLetter.matchId,
+        deadLetter.attemptCount,
+        deadLetter.error
+      );
+    }
+    if (combined.nextRetryAt !== null)
+      scheduleBattlePassRetry(combined.nextRetryAt);
+    return combined;
+  }
+
+  function awardBattlePassForRoom(room, endingUserIds = []) {
+    const battlePass = accountStore && accountStore.battlePass;
+    if (!room.matchId || !battlePass ||
+        typeof battlePass.recordMatchResult !== 'function') return false;
+    const openingParticipants = room.battlePassParticipants || new Set();
+    /* An all-anonymous match has no account award to miss. It is ordinary
+       play, so do not turn its duration and participant floors into warnings. */
+    if (openingParticipants.size === 0) return false;
+    /* A bearer at the opening whistle and a seat at the result are both
+       required for that account's award. Anonymous players and bots do not
+       need database identities and do not prevent an end-to-end account from
+       earning. A disconnect that itself forces fallback is part of that forced
+       result, so fallback supplies that account in endingUserIds. */
+    const present = new Set(
+      Array.from(room.members.values(), (member) => member.userId).filter(Boolean)
+    );
+    for (const userId of endingUserIds)
+      if (typeof userId === 'string' && userId) present.add(userId);
+    const participants = Array.from(openingParticipants)
+      .filter((userId) => present.has(userId));
+    const awardedAt = relayNow();
+    const durationMs = awardedAt - room.battlePassStartedAt;
+    const missedFloors = [];
+    if (durationMs < BATTLE_PASS_MIN_MATCH_DURATION_MS) {
+      missedFloors.push(
+        `duration (${durationMs}ms/${BATTLE_PASS_MIN_MATCH_DURATION_MS}ms)`
+      );
+    }
+    if (participants.length < BATTLE_PASS_MIN_PARTICIPANTS) {
+      missedFloors.push(
+        `participants (${participants.length}/${BATTLE_PASS_MIN_PARTICIPANTS})`
+      );
+    }
+    if (room.battlePassSnapshotCount < BATTLE_PASS_MIN_SNAPSHOTS) {
+      missedFloors.push(
+        `snapshots (${room.battlePassSnapshotCount}/${BATTLE_PASS_MIN_SNAPSHOTS})`
+      );
+    }
+    if (missedFloors.length > 0) {
+      console.warn(
+        `Battle-pass XP refused for match ${room.matchId}; missed ` +
+        `${missedFloors.join(', ')}.`
+      );
+      return false;
+    }
+    const result = {
+      matchId: room.matchId,
+      participants,
+      awardedAt,
+      evidence: {
+        durationMs,
+        participantCount: participants.length,
+        snapshotCount: room.battlePassSnapshotCount
+      }
+    };
+    try {
+      const outcome = battlePass.recordMatchResult(
+        result.matchId,
+        result.participants,
+        result.evidence,
+        result.awardedAt,
+        {
+          retryBaseMs: battlePassRetryMs,
+          maxAttempts: battlePassMaxRetryAttempts
+        }
+      );
+      for (const failure of outcome.failures)
+        logBattlePassFailure(failure.matchId, failure.error);
+      for (const deadLetter of outcome.deadLetters) {
+        logBattlePassGiveUp(
+          deadLetter.matchId,
+          deadLetter.attemptCount,
+          deadLetter.error
+        );
+      }
+      if (outcome.nextRetryAt !== null)
+        scheduleBattlePassRetry(outcome.nextRetryAt);
+      return outcome.failures.some((failure) => failure.matchId === result.matchId) ||
+        outcome.deadLetters.some((failure) => failure.matchId === result.matchId);
+    } catch (error) {
+      /* If even the durable insert is temporarily unavailable, retain the full
+         relay-authored result in memory and apply the same bounded retry policy
+         after ending play. */
+      queueUnrecordedBattlePassMatch(result.matchId, {
+        ...result,
+        attemptCount: 1,
+        nextAttemptAt: Date.now() + battlePassRetryMs,
+        operator: battlePassMaxRetryAttempts <= 1
+      });
+      if (battlePassMaxRetryAttempts <= 1) {
+        logBattlePassGiveUp(result.matchId, 1, error);
+      } else {
+        logBattlePassFailure(result.matchId, error);
+        scheduleBattlePassRetry(Date.now() + battlePassRetryMs);
+      }
+      return true;
+    }
+  }
+
+  function handleRoomMessage(peer, message) {
+    if (message.t === 'create' || message.t === 'join') {
+      sendError(peer, 'already-in-room', 'Leave this room before joining another.');
+      return;
+    }
+
+    if (message.t === 'authority-state') {
+      const migration = peer.room.migrating;
+      if (peer.role !== 'guest' || !migration ||
+          message.authorityEpoch !== peer.room.authorityEpoch ||
+          message.round !== peer.room.round) return;
+      const checked = Protocol.sanitizeAuthorityState(message);
+      if (!checked.ok) {
+        sendError(peer, 'invalid-authority-state', checked.error);
+        return;
+      }
+      migration.states.set(peer.id, checked.value);
+      send(peer.room.host, { ...checked.value, from: peer.id });
+      return;
+    }
+
+    if (message.t === 'authority-ready') {
+      const migration = peer.room.migrating;
+      if (peer.role !== 'host' || !migration ||
+          message.authorityEpoch !== peer.room.authorityEpoch ||
+          message.round !== peer.room.round ||
+          !Number.isSafeInteger(message.tick) ||
+          message.tick !== migration.snapshot.tick) return;
+      for (const id of migration.expected) {
+        if (!migration.states.has(id)) {
+          sendError(peer, 'authority-not-ready', 'Waiting for surviving guest state.');
+          return;
+        }
+      }
+      finishMigration(peer.room);
+      return;
+    }
+
+    /* Above the role gates below on purpose: anyone in the room can report,
+       host and guest alike. The host is the one peer the aim-rate check never
+       sees, so shutting hosts out here would leave the only player nothing
+       watches also unreportable. */
+    if (message.t === 'report') {
+      handleReport(peer, message);
+      return;
+    }
+
+    if (message.t === 'input') {
+      if (peer.role !== 'guest') {
+        sendError(peer, 'guest-only', 'Only guests send input to the host.');
+        return;
+      }
+      handleGuestInput(peer, message);
+      return;
+    }
+
+    if (message.t === 'start') {
+      if (peer.role !== 'host') {
+        sendError(peer, 'host-only', 'Only the host can start a match.');
+        return;
+      }
+      if (!hasCurrentAuthority(peer, message)) return;
+      if (peer.room.started) {
+        sendError(peer, 'already-started', 'The match is already running.');
+        return;
+      }
+      if (peer.room.rules === 'duel' && peer.room.members.size !== 2) {
+        sendError(peer, 'need-two', '1v1 requires exactly two players.');
+        return;
+      }
+      startRound(peer.room);
+      return;
+    }
+
+    /* HOLD: the host is keeping a seat for somebody. It buys time and nothing
+       else — the deadline moves, it never goes away — so the room stays a room
+       people can join and leave rather than one person's waiting decision. */
+    if (message.t === 'hold') {
+      if (peer.role !== 'host') {
+        sendError(peer, 'host-only', 'Only the host can hold the start.');
+        return;
+      }
+      if (!hasCurrentAuthority(peer, message)) return;
+      if (!autoStartEligible(peer.room)) return;
+      if (peer.room.autoStartHolds >= autoStartMaxHolds) {
+        sendError(peer, 'hold-exhausted',
+          'The start cannot be held any longer — everyone here is waiting to play.');
+        return;
+      }
+      peer.room.autoStartHolds++;
+      peer.room.autoStartAt = Date.now() + autoStartHoldMs;
+      scheduleAutoStart(peer.room);
+      broadcastMembers(peer.room);
+      return;
+    }
+
+    if (message.t === 'lobby') {
+      if (peer.role !== 'host') {
+        sendError(peer, 'host-only', 'Only the host can end a round.');
+        return;
+      }
+      if (!hasCurrentAuthority(peer, message)) return;
+      if (!peer.room.started || message.round !== peer.room.round) return;
+      const awardPending = awardBattlePassForRoom(peer.room);
+      peer.room.started = false;
+      peer.room.matchId = null;
+      peer.room.battlePassStartedAt = 0;
+      peer.room.battlePassSnapshotCount = 0;
+      peer.room.battlePassLastCountedSnapshotBucket = -1;
+      peer.room.battlePassParticipants = new Set();
+      clearSnapshotStall(peer.room);
+      peer.room.snapshotAt = 0;
+      peer.room.snapshotIntervalMs = 0;
+      /* Back between rounds is back on the clock: a rematch nobody calls for
+         strands a room exactly the way an uncalled first round does. */
+      scheduleAutoStart(peer.room);
+      broadcastRoom(peer.room, {
+        t: 'lobby',
+        v: Protocol.VERSION,
+        authorityEpoch: peer.room.authorityEpoch,
+        round: peer.room.round,
+        winner: typeof message.winner === 'string' ? message.winner.slice(0, 80) : null
+      });
+      /* After, not before. The roster is what carries the deadline, and a
+         client only knows where to show it once the message above has told it
+         the round is over. */
+      broadcastMembers(peer.room);
+      if (awardPending) {
+        sendError(
+          peer,
+          'battlepass-award-pending',
+          'The round ended normally; battle-pass XP is queued for retry.'
+        );
+      }
+      return;
+    }
+
+    if (RELAY_TYPES.has(message.t)) {
+      if (peer.role !== 'host') {
+        sendError(peer, 'host-only', 'Only the host can send match state.');
+        return;
+      }
+      if (!hasCurrentAuthority(peer, message)) return;
+      if (peer.room.migrating) return;
+      if (!peer.room.started || message.round !== peer.room.round) return;
+      if ((message.t === 'snapshot' || message.t === 'checkpoint') &&
+          message.map !== peer.room.map) {
+        sendError(peer, 'invalid-map-state',
+          'Match state does not match the room map.');
+        return;
+      }
+      if (message.t === 'snapshot' &&
+          (!Number.isSafeInteger(message.tick) || !Number.isFinite(message.time) ||
+           !Number.isSafeInteger(message.eventSeq) ||
+           !Number.isSafeInteger(message.manifestVersion) ||
+           !Array.isArray(message.actors) ||
+           message.actors.length > 16)) {
+        sendError(peer, 'invalid-snapshot', 'Invalid snapshot.');
+        return;
+      }
+      if (message.t === 'checkpoint' && !validCheckpoint(message)) {
+        sendError(peer, 'invalid-checkpoint', 'Invalid checkpoint.');
+        return;
+      }
+      if (message.t === 'event' &&
+          (!Array.isArray(message.events) || message.events.length > 256)) {
+        sendError(peer, 'invalid-event', 'Invalid event batch.');
+        return;
+      }
+      let relayed = message;
+      if (message.t === 'snapshot') {
+        relayed = snapshotWithApprovedCosmetics(peer.room, message);
+        if (peer.room.latestSnapshot &&
+            relayed.tick < peer.room.latestSnapshot.tick) return;
+        const advancesMatch = !peer.room.latestSnapshot ||
+          relayed.tick > peer.room.latestSnapshot.tick;
+        peer.room.latestSnapshot = relayed;
+        if (advancesMatch &&
+            peer.room.battlePassSnapshotCount < BATTLE_PASS_MIN_SNAPSHOTS) {
+          /* A tick is host-authored, so ten increasing ticks in one packet burst
+             are not ten independent relay observations. The relay counts at
+             most one in each match-time bucket, anchored to startRound, while
+             the separate duration check still requires the full 90 seconds.
+             A delayed first snapshot therefore does not extend that floor. */
+          const observedAt = relayNow();
+          const minimumObservationGap = BATTLE_PASS_MIN_MATCH_DURATION_MS /
+            BATTLE_PASS_MIN_SNAPSHOTS;
+          const observationBucket = Math.floor(
+            Math.max(0, observedAt - peer.room.battlePassStartedAt) /
+            minimumObservationGap
+          );
+          if (observationBucket >
+              peer.room.battlePassLastCountedSnapshotBucket) {
+            peer.room.battlePassSnapshotCount++;
+            peer.room.battlePassLastCountedSnapshotBucket = observationBucket;
+          }
+        }
+        observeSnapshot(peer.room, peer);
+      } else if (message.t === 'checkpoint') {
+        if (peer.room.latestCheckpoint &&
+            message.tick < peer.room.latestCheckpoint.tick) return;
+        peer.room.latestCheckpoint = message;
+      }
+      broadcastRoom(peer.room, relayed);
+      return;
+    }
+
+    sendError(peer, 'unknown-type', 'Unknown message type.');
+  }
+
+  /* Browser phone-controller channel (v3 expo addition). A phone pairs
+     with a short code and streams input; the game page that owns the code
+     listens. Controller peers never join a room, so registration also
+     cancels the room-handshake timeout. Nothing here can affect room
+     state: phones can only talk to listeners holding their code. */
+  const ctlPhones = new Map();    // pairing code -> phone peer
+  const ctlListeners = new Map(); // pairing code -> Set of game-page peers
+  function ctlCodeOf(message) {
+    const c = String(message.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    return c.length >= 4 && c.length <= 6 ? c : null;
+  }
+  function handleCtl(peer, message) {
+    if (message.t === 'ctl-hello' || message.t === 'ctl-listen') {
+      const code = ctlCodeOf(message);
+      if (!code) { sendError(peer, 'ctl-code', 'Invalid controller code.'); return; }
+      if (peer.joinTimer) { clearTimeout(peer.joinTimer); peer.joinTimer = null; }
+      if (message.t === 'ctl-hello') {
+        const prev = ctlPhones.get(code);
+        if (prev && prev !== peer) { try { prev.ws.close(1000, 'controller replaced'); } catch (error) {} }
+        ctlPhones.set(code, peer);
+        peer.ctlPhoneCode = code;
+        send(peer, { t: 'ctl-ok', v: Protocol.VERSION, role: 'phone' });
+        const set = ctlListeners.get(code);
+        if (set) for (const l of set) send(l, { t: 'ctl-status', v: Protocol.VERSION, phone: true });
+        peer.ws.once('close', () => {
+          if (ctlPhones.get(code) === peer) ctlPhones.delete(code);
+          const s = ctlListeners.get(code);
+          if (s) for (const l of s) send(l, { t: 'ctl-status', v: Protocol.VERSION, phone: false });
+        });
+      } else {
+        let set = ctlListeners.get(code);
+        if (!set) { set = new Set(); ctlListeners.set(code, set); }
+        set.add(peer);
+        send(peer, { t: 'ctl-ok', v: Protocol.VERSION, role: 'listener', phone: ctlPhones.has(code) });
+        peer.ws.once('close', () => { set.delete(peer); if (!set.size) ctlListeners.delete(code); });
+      }
+      return;
+    }
+    if ((message.t === 'ctl' || message.t === 'ctl-centre') && peer.ctlPhoneCode) {
+      const set = ctlListeners.get(peer.ctlPhoneCode);
+      if (set) for (const l of set) send(l, message);
+    }
+  }
+
+  function handleMessage(peer, raw) {
+    if (peer.moderated) return;
+    if (!consumeRateToken(peer)) {
+      sendError(peer, 'rate-limit', 'Too many messages.');
+      peer.ws.close(1008, 'rate limit exceeded');
+      return;
+    }
+
+    const parsed = Protocol.parseWireMessage(raw, maxMessageBytes);
+    if (!parsed.ok) {
+      sendError(peer, 'invalid-message', parsed.error);
+      return;
+    }
+
+    const message = parsed.value;
+    const messageShape = inspectMessageShape(message);
+    if (messageShape === MESSAGE_SHAPE_INVALID) {
+      sendError(peer, 'invalid-shape', 'Message nesting or collection size is invalid.');
+      return;
+    }
+    if (message.v !== Protocol.VERSION) {
+      /* The client renders this string verbatim, and the only person who ever
+         sees it is a player holding a page from before the last deploy. Naming
+         the protocol tells them nothing they can act on; "reload" is the whole
+         remedy, so say that instead. */
+      sendError(peer, 'version', 'This game is out of date. Reload the page to keep playing.');
+      return;
+    }
+    if (typeof message.t === 'string' && message.t.startsWith('ctl')) {
+      handleCtl(peer, message);
+      return;
+    }
+    if (messageShape === MESSAGE_SHAPE_FORBIDDEN_PROGRESS) {
+      sendError(
+        peer,
+        'client-progress-forbidden',
+        'Battle-pass progress is awarded only from relay match results.'
+      );
+      return;
+    }
+
+    if (!peer.room) {
+      if (message.t === 'create') {
+        handleCreate(peer, message);
+      } else if (message.t === 'join') {
+        handleJoin(peer, message);
+      } else {
+        sendError(peer, 'not-in-room', 'Create or join a room first.');
+      }
+      return;
+    }
+
+    handleRoomMessage(peer, message);
+  }
+
+  function clearRoomMembership(peer) {
+    peer.room = null;
+    peer.role = null;
+    peer.name = '';
+    peer.userId = null;
+    peer.cosmetics = Protocol.sanitizeCosmetics(null);
+    peer.supportedMaps = [];
+    peer.lastSeq = -1;
+  }
+
+  function clearSnapshotStall(room) {
+    if (room.snapshotStallTimer) clearTimeout(room.snapshotStallTimer);
+    room.snapshotStallTimer = null;
+  }
+
+  function armSnapshotStall(room, host, delayMs) {
+    clearSnapshotStall(room);
+    if (!room.started || room.migrating || !host) return;
+    const epoch = room.authorityEpoch;
+    room.snapshotStallTimer = setTimeout(() => {
+      room.snapshotStallTimer = null;
+      if (room.started && !room.migrating && room.host === host &&
+          room.authorityEpoch === epoch) {
+        beginMigration(room, host, true);
+        try { host.ws.close(1012, 'authority snapshot stalled'); } catch (error) {}
+      }
+    }, delayMs);
+    if (typeof room.snapshotStallTimer.unref === 'function')
+      room.snapshotStallTimer.unref();
+  }
+
+  function observeSnapshot(room, host) {
+    const now = Date.now();
+    if (room.snapshotAt) {
+      const sample = now - room.snapshotAt;
+      if (sample >= 10 && sample <= 5_000) {
+        room.snapshotIntervalMs = room.snapshotIntervalMs
+          ? room.snapshotIntervalMs * 0.8 + sample * 0.2
+          : sample;
+      }
+    }
+    room.snapshotAt = now;
+    /* Until a second snapshot has priced the cadence, the grace deadline stands
+       in for it. Giving up here instead left the room with no watchdog at all,
+       which a host that sent exactly one snapshot -- the forced one every
+       migration ends with -- turned into a room nothing was ever watching. */
+    armSnapshotStall(room, host, room.snapshotIntervalMs
+      ? Math.ceil(room.snapshotIntervalMs * snapshotStallCount)
+      : authorityGraceMs);
+  }
+
+  function canMigrateSeamlessly(room) {
+    const snapshot = room.latestSnapshot;
+    const checkpoint = room.latestCheckpoint;
+    if (!snapshot || !checkpoint ||
+        snapshot.map !== room.map || checkpoint.map !== room.map ||
+        snapshot.authorityEpoch !== room.authorityEpoch ||
+        checkpoint.authorityEpoch !== room.authorityEpoch ||
+        snapshot.round !== room.round || checkpoint.round !== room.round ||
+        !Array.isArray(snapshot.actors) || snapshot.actors.length < 1 ||
+        snapshot.over !== false ||
+        snapshot.manifestVersion !== checkpoint.manifestVersion) return false;
+    const migrationBytes = encode({ snapshot, checkpoint });
+    if (migrationBytes === null ||
+        Buffer.byteLength(migrationBytes, 'utf8') > maxMessageBytes - 4096) return false;
+    const metadata = new Set(checkpoint.actors.map((actor) => actor.netId));
+    return metadata.size === snapshot.actors.length &&
+      snapshot.actors.every((actor) =>
+      actor && typeof actor.netId === 'string' && metadata.has(actor.netId));
+  }
+
+  function nextMigrationCandidate(room) {
+    const attempted = room.migrating ? room.migrating.attempted : new Set();
+    for (const peer of room.members.values()) {
+      if (peer.role === 'guest' && peer.alive &&
+          peer.supportedMaps.includes(room.map) && !attempted.has(peer.id)) return peer;
+    }
+    return null;
+  }
+
+  function fallbackRestart(room, additionalEndingUserIds = []) {
+    const migrationDepartures = room.migrating
+      ? room.migrating.departedUserIds
+      : [];
+    if (room.started) {
+      awardBattlePassForRoom(room, [
+        ...migrationDepartures,
+        ...additionalEndingUserIds
+      ]);
+    }
+    if (room.migrating && room.migrating.timer) clearTimeout(room.migrating.timer);
+    room.migrating = null;
+    clearSnapshotStall(room);
+    const nextHost = room.members.values().next().value;
+    if (!nextHost) {
+      clearAutoStart(room);
+      rooms.delete(room.code);
+      room.host = null;
+      room.started = false;
+      return;
+    }
+    for (const member of room.members.values())
+      member.role = member === nextHost ? 'host' : 'guest';
+    room.host = nextHost;
+    room.started = false;
+    room.round++;
+    room.authorityEpoch++;
+    room.latestSnapshot = null;
+    room.latestCheckpoint = null;
+    room.matchId = null;
+    room.battlePassStartedAt = 0;
+    room.battlePassSnapshotCount = 0;
+    room.battlePassLastCountedSnapshotBucket = -1;
+    room.battlePassParticipants = new Set();
+    for (const member of room.members.values()) {
+      member.lastSeq = -1;
+      member.activeAt = Date.now();
+    }
+    /* The new host inherits a lobby, so it inherits the clock too — and the
+       roster broadcast is what carries the deadline, since `host-changed` is a
+       fixed shape the clients sanitise field by field. */
+    scheduleAutoStart(room);
+    broadcastRoom(room, {
+      t: 'host-changed',
+      v: Protocol.VERSION,
+      authorityEpoch: room.authorityEpoch,
+      round: room.round,
+      map: room.map,
+      host: nextHost.id,
+      members: memberList(room)
+    }, true);
+    broadcastMembers(room);
+  }
+
+  function attemptPromotion(room) {
+    const nextHost = nextMigrationCandidate(room);
+    if (!nextHost) {
+      fallbackRestart(room);
+      return;
+    }
+    if (room.migrating.timer) clearTimeout(room.migrating.timer);
+    for (const member of room.members.values())
+      member.role = member === nextHost ? 'host' : 'guest';
+    room.migrating.attempted.add(nextHost.id);
+    room.migrating.states = new Map();
+    room.migrating.expected = new Set(
+      Array.from(room.members.values(), (peer) => peer.id)
+        .filter((id) => id !== nextHost.id)
+    );
+    room.host = nextHost;
+    room.authorityEpoch++;
+    broadcastRoom(room, {
+      t: 'host-changed',
+      v: Protocol.VERSION,
+      authorityEpoch: room.authorityEpoch,
+      round: room.round,
+      map: room.map,
+      host: nextHost.id,
+      members: memberList(room),
+      seamless: true,
+      snapshot: room.migrating.snapshot,
+      checkpoint: room.migrating.checkpoint
+    }, true);
+    room.migrating.timer = setTimeout(() => {
+      if (!room.migrating || room.host !== nextHost) return;
+      nextHost.role = 'guest';
+      attemptPromotion(room);
+    }, promotionTimeoutMs);
+    if (typeof room.migrating.timer.unref === 'function')
+      room.migrating.timer.unref();
+  }
+
+  function beginMigration(room, failedHost, removeHost) {
+    clearSnapshotStall(room);
+    clearAutoStart(room);
+    const failedUserId = failedHost.userId;
+    if (removeHost) {
+      room.members.delete(failedHost.id);
+      clearRoomMembership(failedHost);
+    } else {
+      failedHost.role = 'guest';
+    }
+    if (!room.members.size) {
+      fallbackRestart(room, failedUserId ? [failedUserId] : []);
+      return;
+    }
+    if (!room.started || !canMigrateSeamlessly(room)) {
+      /* fallbackRestart puts the room back in a lobby, which is a lobby that
+         needs its clock re-armed — it does that itself. */
+      fallbackRestart(room, failedUserId ? [failedUserId] : []);
+      return;
+    }
+    room.migrating = {
+      attempted: new Set([failedHost.id]),
+      states: new Map(),
+      expected: new Set(),
+      snapshot: room.latestSnapshot,
+      checkpoint: room.latestCheckpoint,
+      /* If every promotion fails, the disconnects themselves become the
+         forced result. Remember those account ids so fallback can treat them
+         as present at that endpoint after their room memberships are cleared. */
+      departedUserIds: new Set(failedUserId ? [failedUserId] : []),
+      timer: null
+    };
+    attemptPromotion(room);
+  }
+
+  function finishMigration(room) {
+    if (!room.migrating) return;
+    const migration = room.migrating;
+    if (migration.timer) clearTimeout(migration.timer);
+    room.migrating = null;
+    for (const member of room.members.values()) {
+      member.lastSeq = -1;
+      member.activeAt = Date.now();
+    }
+    broadcastRoom(room, {
+      t: 'authority-ready',
+      v: Protocol.VERSION,
+      authorityEpoch: room.authorityEpoch,
+      round: room.round,
+      host: room.host.id
+    }, true);
+    room.snapshotAt = 0;
+    room.snapshotIntervalMs = 0;
+    armSnapshotStall(room, room.host, authorityGraceMs);
+  }
+
+  function migrateHostedRoom(room, departedHost) {
+    if (room.migrating) {
+      if (departedHost.userId)
+        room.migrating.departedUserIds.add(departedHost.userId);
+      room.members.delete(departedHost.id);
+      clearRoomMembership(departedHost);
+      attemptPromotion(room);
+      return;
+    }
+    beginMigration(room, departedHost, true);
+  }
+
+  function leaveRoom(peer) {
+    const room = peer.room;
+    if (!room) return;
+    /* Before the host branch below, which returns without coming back here,
+       and before clearRoomMembership takes the seat number back. */
+    console.log(`Leave: ${describePeer(peer)} from room ${room.code}`);
+
+    if (peer.role === 'host') {
+      migrateHostedRoom(room, peer);
+      return;
+    }
+
+    room.members.delete(peer.id);
+    clearRoomMembership(peer);
+    if (room.migrating) room.migrating.expected.delete(peer.id);
+    /* A room back down to one person has nobody to play against, so the clock
+       stops rather than starting a host alone against the bots. */
+    scheduleAutoStart(room);
+    broadcastMembers(room);
+  }
+
+  function cleanupPeer(peer) {
+    if (peer.cleanedUp) return;
+    peer.cleanedUp = true;
+    if (peer.joinTimer) clearTimeout(peer.joinTimer);
+    peers.delete(peer.ws);
+    leaveRoom(peer);
+  }
+
+  wss.on('connection', (ws, request) => {
+    const peer = {
+      ws,
+      id: String(makeId()),
+      name: '',
+      userId: null,
+      address: clientAddressFromRequest(request),
+      role: null,
+      room: null,
+      slot: -1,
+      cosmetics: Protocol.sanitizeCosmetics(null),
+      supportedMaps: [],
+      lastSeq: -1,
+      alive: true,
+      cleanedUp: false,
+      moderated: false,
+      rateTokens: rateBurst,
+      rateUpdatedAt: Date.now(),
+      joinTimer: null,
+      activeAt: Date.now(),
+      lastFireSeq: -1,
+      lastWeaponSeq: -1,
+      lastReloadSeq: -1,
+      lastYaw: 0,
+      lastPitch: 0,
+      aimSeq: -1,
+      aimTravel: 0,
+      aimStrikes: 0,
+      /* Who this peer has reported, and who has reported it, both scoped to
+         the connection. A reconnect is a new peer and starts empty, which is
+         the honest reading: the second sitting is a second opinion. */
+      reported: new Set(),
+      reporters: new Set(),
+      pingAt: 0,
+      rttMs: 0
+    };
+    peers.set(ws, peer);
+    peer.joinTimer = setTimeout(() => {
+      if (!peer.room && peer.ws.readyState === WebSocket.OPEN)
+        peer.ws.close(1008, 'room handshake timeout');
+    }, joinTimeoutMs);
+    if (typeof peer.joinTimer.unref === 'function') peer.joinTimer.unref();
+
+    ws.on('pong', () => {
+      peer.alive = true;
+      if (peer.pingAt > 0) {
+        peer.rttMs = Math.max(0, Date.now() - peer.pingAt);
+        peer.pingAt = 0;
+      }
+    });
+    ws.on('message', (raw) => {
+      try {
+        handleMessage(peer, raw);
+      } catch (error) {
+        sendError(peer, 'invalid-message', 'Message processing failed.');
+        peer.ws.close(1008, 'invalid message');
+      }
+    });
+    ws.on('close', () => {
+      cleanupPeer(peer);
+    });
+    ws.on('error', () => {
+      cleanupPeer(peer);
+    });
+    const networkBan = bans.match(peer);
+    if (networkBan) {
+      peer.moderated = true;
+      sendError(peer, 'banned', 'Banned by the server operator.');
+      console.warn(`Rejected banned network ${bans.networkFingerprint(peer.address)}`);
+      try { ws.close(1008, 'banned'); } catch (error) { ws.terminate(); }
+    }
+  });
+
+  server.on('upgrade', (request, socket, head) => {
+    let pathname;
+    try {
+      pathname = new URL(request.url || '/', 'http://localhost').pathname;
+    } catch (error) {
+      socket.destroy();
+      return;
+    }
+
+    if (pathname === '/gyro') {
+      if (!originAllowed(request)) {
+        socket.destroy();
+        return;
+      }
+      gyroWss.handleUpgrade(request, socket, head, (ws) => {
+        gyroWss.emit('connection', ws, request);
+      });
+      return;
+    }
+    if (pathname !== '/ws') {
+      socket.destroy();
+      return;
+    }
+    if (!originAllowed(request)) {
+      socket.destroy();
+      return;
+    }
+    if (peers.size >= maxConnections) {
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  });
+
+  /* Only guests, and only in a running match. The host is the simulation —
+     dropping it costs everybody a migration to reclaim one seat — and a lobby
+     is a place where sitting still is the entire activity. */
+  function sweepIdlePeers() {
+    const now = Date.now();
+    for (const peer of peers.values()) {
+      if (peer.role !== 'guest' || !peer.room || !peer.room.started) continue;
+      if (peer.room.migrating) continue;
+      if (now - peer.activeAt < idleKickMs) continue;
+      sendError(peer, 'idle', 'Removed for sitting out the match.');
+      try { peer.ws.close(1008, 'idle'); } catch (error) { peer.ws.terminate(); }
+    }
+  }
+
+  const idleSweep = idleKickMs > 0 ? setInterval(sweepIdlePeers, idleSweepMs) : null;
+  if (idleSweep && typeof idleSweep.unref === 'function') idleSweep.unref();
+
+  const heartbeat = heartbeatMs > 0
+    ? setInterval(() => {
+      for (const peer of peers.values()) {
+        if (!peer.alive) {
+          peer.ws.terminate();
+          continue;
+        }
+
+        peer.alive = false;
+        pingPeer(peer);
+      }
+    }, heartbeatMs)
+    : null;
+  if (heartbeat && typeof heartbeat.unref === 'function') heartbeat.unref();
+
+  retryBattlePassAwards();
+
+  async function close() {
+    if (heartbeat) clearInterval(heartbeat);
+    if (idleSweep) clearInterval(idleSweep);
+    /* A planned shutdown is also a match result for every room still in play.
+       Record those relay-authored results while memberships and the account
+       database are still available, then give any fallback queue one final
+       chance to reach the durable pending table. */
+    for (const room of rooms.values())
+      if (room.started) awardBattlePassForRoom(room);
+    retryBattlePassAwards();
+    if (battlePassRetryTimer) clearTimeout(battlePassRetryTimer);
+    battlePassRetryTimer = null;
+    battlePassRetryAt = null;
+    /* A planned shutdown is a deploy, and a deploy that quietly dropped the
+       last few minutes of the count would be the common case, not the rare one. */
+    if (statsTimer) clearTimeout(statsTimer);
+    statsTimer = null;
+    flushStats();
+    const fallback = battlePassFallbackState();
+    if (fallback.queued > 0) {
+      console.error(
+        `Relay closing with ${fallback.queued} unrecorded battle-pass ` +
+        `matches (${fallback.operator} awaiting operator attention, ` +
+        `${fallback.dropped} previously discarded).`
+      );
+    }
+    for (const room of rooms.values()) {
+      clearSnapshotStall(room);
+      clearAutoStart(room);
+      if (room.migrating && room.migrating.timer) clearTimeout(room.migrating.timer);
+    }
+    for (const peer of peers.values()) peer.ws.terminate();
+    for (const pair of gyroPairs.values()) for (const ws of [pair.game, pair.phone]) if (ws) ws.terminate();
+    gyroWss.close();
+
+    if (server.listening) {
+      await new Promise((resolveClose, rejectClose) => {
+        server.close((error) => {
+          if (error) rejectClose(error);
+          else resolveClose();
+        });
+      });
+    }
+    if (accountStore && typeof accountStore.close === 'function') accountStore.close();
+  }
+
+  return {
+    server,
+    wss,
+    rooms,
+    retryBattlePassAwards,
+    battlePassFallbackState,
+    listen: (...args) => server.listen(...args),
+    address: () => server.address(),
+    close
+  };
+}
+
+const isMain = process.argv[1] &&
+  pathToFileURL(resolve(process.argv[1])).href === import.meta.url;
+
+/* systemd sets STATE_DIRECTORY from `StateDirectory=` in the unit, and that is
+   the only path the service can write to — ProtectSystem=strict makes the
+   install directory read-only. Taking the path from the environment rather
+   than hardcoding /var/lib/nuketown keeps the two in step, and running without
+   it (a bare `npm start`) simply means the count does not persist. Colons
+   separate multiple directories; the first is ours. */
+function statsPathFromEnvironment(env) {
+  if (env.STATS_PATH) return resolve(env.STATS_PATH);
+  const stateDir = (env.STATE_DIRECTORY || '').split(':')[0];
+  return stateDir ? resolve(stateDir, 'stats.json') : null;
+}
+
+export function banPathFromEnvironment(env) {
+  if (env.BAN_PATH) return resolve(env.BAN_PATH);
+  const stateDir = (env.STATE_DIRECTORY || '').split(':')[0];
+  return stateDir ? resolve(stateDir, 'bans.json') : null;
+}
+
+export function accountStoreForEnvironment(env, options = {}) {
+  /* Production remains strict by default. Local and LAN relays can opt out
+     explicitly without inventing OAuth and Stripe credentials; this removes
+     only the additive HTTP account routes and leaves the public relay exactly
+     as it was before accounts existed. */
+  if (String(env.ACCOUNTS_ENABLED || '').trim() === '0') return null;
+  return createAccountStoreFromEnvironment(env, options);
+}
+
+if (isMain) {
+  const port = Number.parseInt(process.env.PORT || '8080', 10);
+  const host = process.env.HOST || '0.0.0.0';
+  const configuredOrigins = (process.env.ALLOWED_ORIGINS || '').split(',');
+  /* Accounts are part of a production boot, not a best-effort extra. Building
+     the service before opening the listening socket makes a missing Google or
+     Stripe secret a visible failed unit instead of a healthy-looking relay
+     whose Sign in and Buy buttons fail later. */
+  const accountStore = accountStoreForEnvironment(process.env);
+  const relay = createRelayServer({
+    allowedOrigins: configuredOrigins,
+    accountStore,
+    adminToken: process.env.ADMIN_TOKEN || '',
+    banPath: banPathFromEnvironment(process.env),
+    statsPath: statsPathFromEnvironment(process.env),
+    /* Both halves of the aim limit are a decision made after reading the logs,
+       so both are a restart rather than a code change. Unset leaves the
+       defaults, which watch and act on nothing. */
+    aimRateLimit: Number.parseFloat(process.env.AIM_RATE_LIMIT || ''),
+    aimRateStrikes: Number.parseInt(process.env.AIM_RATE_STRIKES || '0', 10)
+  });
+
+  relay.listen(port, host, () => {
+    const address = relay.address();
+    const shownHost = address && typeof address === 'object'
+      ? address.address
+      : host;
+    const shownPort = address && typeof address === 'object'
+      ? address.port
+      : port;
+    console.log(`Pastel Nuketown listening on http://${shownHost}:${shownPort}`);
+  });
+
+  const shutdown = async () => {
+    try {
+      await relay.close();
+      process.exit(0);
+    } catch (error) {
+      console.error(error);
+      process.exit(1);
+    }
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+        }
