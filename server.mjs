@@ -843,15 +843,21 @@ export function createRelayServer(options = {}) {
      browsers do it natively. Default 10s: worst-case stale-detection ~20s. */
   const gyroHeartbeatMs = positiveInteger(options.gyroHeartbeatMs, 10_000);
   const gyroAlive = new WeakMap();
+  console.log(`Gyro: heartbeat armed every ${gyroHeartbeatMs}ms`);
   const gyroHeartbeat = setInterval(() => {
-    for (const pair of gyroPairs.values()) {
-      for (const sock of [pair.game, pair.phone]) {
-        if (!sock) continue;
-        if (gyroAlive.get(sock) === false) { try { sock.terminate(); } catch {} continue; }
-        gyroAlive.set(sock, false);
-        try { sock.ping(); } catch {}
+    try {
+      let socks = 0;
+      for (const pair of gyroPairs.values()) {
+        for (const sock of [pair.game, pair.phone]) {
+          if (!sock) continue;
+          socks++;
+          if (gyroAlive.get(sock) === false) { try { sock.terminate(); } catch {} continue; }
+          gyroAlive.set(sock, false);
+          try { sock.ping(); } catch {}
+        }
       }
-    }
+      if (socks > 0) console.log(`Gyro: heartbeat tick over ${socks} socket(s)`);
+    } catch (e) { console.log('Gyro: heartbeat error', e && e.message); }
   }, gyroHeartbeatMs);
   gyroHeartbeat.unref?.();
   gyroWss.on('connection', (ws, request) => {
