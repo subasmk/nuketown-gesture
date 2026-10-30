@@ -837,12 +837,8 @@ export function createRelayServer(options = {}) {
   /* A half-open gyro socket (laptop asleep, wifi dropped, tunnel vanished)
      never fires 'close', so the pair state would freeze with a dead side
      looking connected - the phone would keep saying Connected to nothing.
-     Ping both gyro roles on a short clock; a socket that misses a whole round
-     is terminated, which fires 'close' and updates the pair state. The
-     Android app answers pings (MiniWebSocket replies pong to opcode 9) and
-     browsers do it natively. Default 10s: worst-case stale-detection ~20s. */
+     Tick interval for the staleness sweep below. */
   const gyroHeartbeatMs = positiveInteger(options.gyroHeartbeatMs, 10_000);
-  const gyroAlive = new WeakMap();
   /* An edge proxy can answer WebSocket pings on a dead client's behalf (and
      never deliver the server's pings to a live one) - observed against the
      Render deployment - so pong frames are not reliable proof of life there.
@@ -890,8 +886,6 @@ export function createRelayServer(options = {}) {
     console.log(`Gyro: ${isGame ? 'game' : 'phone'} joined code ${code}` +
       ` (game=${!!pair.game} phone=${!!pair.phone})`);
     gyroTellPhone(pair);
-    gyroAlive.set(ws, true);
-    ws.on('pong', () => gyroAlive.set(ws, true));
     ws.on('message', (data) => {
       /* Keepalive frames from either side are liveness proof, not input. */
       try { const m = JSON.parse(data.toString()); if (m && m.t === 'hb') { if (isGame) pair.gameMsgAt = Date.now(); else pair.phoneMsgAt = Date.now(); return; } } catch {}
