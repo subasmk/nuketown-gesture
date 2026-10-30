@@ -611,6 +611,10 @@ body.touch .sens{display:none}
   padding:13px 15px 15px;border:2.5px solid var(--ink);border-radius:16px;
   background:rgba(255,248,240,.96);box-shadow:0 5px 0 var(--ink),0 12px 26px rgba(74,63,92,.24)}
 #title.hud .menu-settings:not([data-open]){display:none}
+/* Phone/gesture helper panels clutter the menu (and overlap its controls on
+   small screens): they only appear while the settings popover is open. */
+#ctl-panel,#phone-panel,#gesture-panel{display:none}
+body[data-settings-open] #ctl-panel,body[data-settings-open] #phone-panel,body[data-settings-open] #gesture-panel{display:block}
 #title.hud .menu-settings .sens,#title.hud .menu-settings .look-invert{width:100%}
 
 /* ---- the two rails ---- */
@@ -1623,4 +1627,4 @@ body.touch .touch-keys{display:flex}
 #rotate strong{font-family:var(--disp);font-size:19px;font-weight:800;letter-spacing:.05em}
 #rotate p{font-family:var(--disp);font-size:13px;font-weight:600;line-height:1.45;color:var(--ink-soft)}
 @keyframes rturn{0%,40%{transform:rotate(0)}60%,100%{transform:rotate(90deg)}}
-</style>
+   </style>
