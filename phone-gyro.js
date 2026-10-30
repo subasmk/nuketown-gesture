@@ -53,6 +53,12 @@ function phoneConnect() {
   PHONE.ws = ws;
   phoneStatus('Waiting for phone... in the phone app, type this address and code ' + PHONE.code + '.');
   ws.onopen = () => phoneStatus('Ready. Phone app: address ' + location.host + ', code ' + PHONE.code + ', then CONNECT.');
+  /* Application-level liveness: some proxies answer WebSocket pings at the
+     edge, so the server cannot trust pong frames to mean this page is alive.
+     A tiny app message every 5s is unforgeable proof; the server drops a
+     game that goes silent for >15s and tells the phone. */
+  if (PHONE.hb) clearInterval(PHONE.hb);
+  PHONE.hb = setInterval(() => { try { if (ws.readyState === 1) ws.send('{"t":"hb"}'); } catch (e) {} }, 5000);
   ws.onmessage = e => {
     try {
       const m = JSON.parse(e.data);
@@ -81,7 +87,7 @@ function phoneConnect() {
       phoneStatus(PHONE.fire ? 'Phone live — FIRING' : 'Phone live — point aims, Vol UP shoots, Vol DOWN jumps. Webcam hand = walking.');
     } catch {}
   };
-  ws.onclose = () => { if (PHONE.ws === ws) { PHONE.ws = null; phoneRelease(); phoneStatus('Phone disconnected. Tap CONNECT PHONE to retry.'); } };
+  ws.onclose = () => { if (PHONE.hb) { clearInterval(PHONE.hb); PHONE.hb = null; } if (PHONE.ws === ws) { PHONE.ws = null; phoneRelease(); phoneStatus('Phone disconnected. Tap CONNECT PHONE to retry.'); } };
   ws.onerror = () => {};
 }
 addEventListener('DOMContentLoaded', () => {

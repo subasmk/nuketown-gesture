@@ -843,21 +843,29 @@ export function createRelayServer(options = {}) {
      browsers do it natively. Default 10s: worst-case stale-detection ~20s. */
   const gyroHeartbeatMs = positiveInteger(options.gyroHeartbeatMs, 10_000);
   const gyroAlive = new WeakMap();
-  console.log(`Gyro: heartbeat armed every ${gyroHeartbeatMs}ms`);
+  /* An edge proxy can answer WebSocket pings on a dead client's behalf (and
+     never deliver the server's pings to a live one), so pong frames prove
+     nothing through a proxy. Only an application message is unforgeable
+     proof of life: the game page sends {"t":"hb"} every 5s and the Android
+     app streams sensor messages constantly while its controller service is
+     up. Either side silent for gyroSilenceMs is terminated, which fires
+     'close' and updates the pair state. Pings are still sent as harmless
+     NAT/proxy keepalives, but never used to judge liveness. */
+  const gyroSilenceMs = positiveInteger(options.gyroSilenceMs, 20_000);
   const gyroHeartbeat = setInterval(() => {
-    try {
-      let socks = 0;
-      for (const pair of gyroPairs.values()) {
-        for (const sock of [pair.game, pair.phone]) {
-          if (!sock) continue;
-          socks++;
-          if (gyroAlive.get(sock) === false) { try { sock.terminate(); } catch {} continue; }
-          gyroAlive.set(sock, false);
-          try { sock.ping(); } catch {}
-        }
+    const nowMs = Date.now();
+    for (const pair of gyroPairs.values()) {
+      for (const sock of [pair.game, pair.phone]) {
+        if (!sock) continue;
+        try { sock.ping(); } catch {}
       }
-      if (socks > 0) console.log(`Gyro: heartbeat tick over ${socks} socket(s)`);
-    } catch (e) { console.log('Gyro: heartbeat error', e && e.message); }
+      if (pair.game && nowMs - (pair.gameMsgAt || pair.gameAt || 0) > gyroSilenceMs) {
+        try { pair.game.terminate(); } catch {}
+      }
+      if (pair.phone && nowMs - (pair.phoneMsgAt || pair.phoneAt || 0) > gyroSilenceMs) {
+        try { pair.phone.terminate(); } catch {}
+      }
+    }
   }, gyroHeartbeatMs);
   gyroHeartbeat.unref?.();
   gyroWss.on('connection', (ws, request) => {
@@ -873,7 +881,8 @@ export function createRelayServer(options = {}) {
     if (!pair) { pair = { game: null, phone: null }; gyroPairs.set(code, pair); }
     const prev = isGame ? pair.game : pair.phone;
     if (prev && prev !== ws && prev.readyState === WebSocket.OPEN) prev.terminate();
-    if (isGame) pair.game = ws; else pair.phone = ws;
+    if (isGame) { pair.game = ws; pair.gameAt = Date.now(); pair.gameMsgAt = Date.now(); }
+    else { pair.phone = ws; pair.phoneAt = Date.now(); pair.phoneMsgAt = Date.now(); }
     /* Phone fire/aim failures are otherwise invisible: the relay is verbatim,
        so a phone paired with no laptop listening (or the reverse) looked
        exactly like a working pair from either screen. */
@@ -883,6 +892,11 @@ export function createRelayServer(options = {}) {
     gyroAlive.set(ws, true);
     ws.on('pong', () => gyroAlive.set(ws, true));
     ws.on('message', (data) => {
+      if (isGame) {
+        pair.gameMsgAt = Date.now();
+        /* Keepalive frames are liveness proof, not phone input. */
+        try { const m = JSON.parse(data.toString()); if (m && m.t === 'hb') return; } catch {}
+      } else pair.phoneMsgAt = Date.now();
       const target = isGame ? pair.phone : pair.game;
       if (target && target.readyState === WebSocket.OPEN) target.send(data.toString());
     });

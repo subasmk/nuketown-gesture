@@ -13,6 +13,7 @@ const ctx = {
   G: { started: true, paused: false, over: false, player: { alive: true } },
   IN: { firing: false }, mouseSens: .0021, KEY: {},
   addEventListener: (k, f) => callbacks[k] = f,
+  setInterval: () => 1, clearInterval: () => {},
   pressFire: () => { shots++; ctx.IN.firing = true; },
   releaseFire: () => { releases++; ctx.IN.firing = false; },
   applyLook: (...x) => look = x,

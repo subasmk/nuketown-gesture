@@ -248,10 +248,10 @@ test('gyro pair-state: a replacement game re-acks the waiting phone', async (t) 
 
 test('gyro heartbeat: a silent (half-open) game socket is dropped and the phone hears paired:false', async () => {
   const { createRelayServer } = await import('./server.mjs');
-  const relay = createRelayServer({ gyroHeartbeatMs: 150 });
+  const relay = createRelayServer({ gyroHeartbeatMs: 150, gyroSilenceMs: 300 });
   await new Promise((resolve, reject) => { relay.server.once('error', reject); relay.listen(0, '127.0.0.1', resolve); });
   const port = relay.address().port;
-  // Raw socket: handshakes, then never answers pings (simulates laptop asleep / half-open).
+  // Raw socket: handshakes, then never answers pings and never sends app messages (laptop asleep / half-open).
   const { connect } = await import('net');
   const raw = await new Promise((resolve, reject) => {
     const key = Buffer.from('0123456789abcdef').toString('base64');
@@ -266,27 +266,46 @@ test('gyro heartbeat: a silent (half-open) game socket is dropped and the phone 
   const states = [];
   phone.on('message', m => states.push(JSON.parse(m.toString())));
   await new Promise((resolve) => phone.once('open', resolve));
+  const phoneStream = setInterval(() => { try { phone.send('{"t":"aim","yaw":1,"pitch":0}'); } catch {} }, 100);
   try {
     await new Promise(r => setTimeout(r, 900));   // phone joins before round 1; ~6 rounds total
     assert.deepEqual(states.map(s => s.on), [true, false], `expected paired true then false, got ${JSON.stringify(states)}`);
-  } finally { raw.destroy(); phone.close(); await relay.close(); }
+  } finally { clearInterval(phoneStream); raw.destroy(); phone.close(); await relay.close(); }
 });
 
-test('gyro heartbeat: a phone that answers pings stays connected', async () => {
+test('gyro heartbeat: a game sending keepalives (but never ponging) stays connected', async () => {
   const { createRelayServer } = await import('./server.mjs');
-  const relay = createRelayServer({ gyroHeartbeatMs: 150 });
+  const relay = createRelayServer({ gyroHeartbeatMs: 150, gyroSilenceMs: 300 });
   await new Promise((resolve, reject) => { relay.server.once('error', reject); relay.listen(0, '127.0.0.1', resolve); });
   const port = relay.address().port;
-  const game = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=game&code=ALIV`);
-  await new Promise((resolve) => game.once('open', resolve));
+  // Raw game socket that never pongs but sends app-level keepalives, like the real page behind a proxy that eats pings.
+  const { connect: connect2 } = await import('net');
+  const game = await new Promise((resolve, reject) => {
+    const key = Buffer.from('0123456789abcdef').toString('base64');
+    const sock = connect2(port, '127.0.0.1', () => {
+      sock.write(`GET /gyro?role=game&code=ALIV HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+    });
+    let buf = Buffer.alloc(0);
+    sock.on('data', d => { buf = Buffer.concat([buf, d]); if (buf.includes('\r\n\r\n')) resolve(sock); });
+    sock.on('error', reject);
+  });
+  const sendText = (sock, str) => {
+    const p = Buffer.from(str);
+    const mask = Buffer.from([0x12, 0x34, 0x56, 0x78]);
+    const h = Buffer.from([0x81, 0x80 | p.length]);
+    const masked = Buffer.from(p.map((b, i) => b ^ mask[i % 4]));
+    sock.write(Buffer.concat([h, mask, masked]));
+  };
+  const hbTimer = setInterval(() => sendText(game, '{"t":"hb"}'), 100);
   const phone = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=phone&code=ALIV`);
   let lastState = null;
   phone.on('message', m => { lastState = JSON.parse(m.toString()); });
   await new Promise((resolve) => phone.once('open', resolve));
+  const phoneStream = setInterval(() => { try { phone.send('{"t":"aim","yaw":1,"pitch":0}'); } catch {} }, 100);
   try {
-    await new Promise(r => setTimeout(r, 900));   // ws lib auto-pongs: nothing should be dropped
-    assert.equal(game.readyState, WebSocket.OPEN);
+    await new Promise(r => setTimeout(r, 900));   // keepalives beat the silence rule even with zero pongs
+    assert.equal(game.destroyed, false, 'game socket should still be open');
     assert.equal(phone.readyState, WebSocket.OPEN);
     assert.deepEqual(lastState, { t: 'paired', on: true });
-  } finally { game.close(); phone.close(); await relay.close(); }
+  } finally { clearInterval(hbTimer); clearInterval(phoneStream); game.destroy(); phone.close(); await relay.close(); }
 });
