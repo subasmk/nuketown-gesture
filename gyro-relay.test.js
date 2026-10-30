@@ -245,3 +245,48 @@ test('gyro pair-state: a replacement game re-acks the waiting phone', async (t) 
   game2.close();
   phone.close();
 });
+
+test('gyro heartbeat: a silent (half-open) game socket is dropped and the phone hears paired:false', async () => {
+  const { createRelayServer } = await import('./server.mjs');
+  const relay = createRelayServer({ gyroHeartbeatMs: 150 });
+  await new Promise((resolve, reject) => { relay.server.once('error', reject); relay.listen(0, '127.0.0.1', resolve); });
+  const port = relay.address().port;
+  // Raw socket: handshakes, then never answers pings (simulates laptop asleep / half-open).
+  const { connect } = await import('net');
+  const raw = await new Promise((resolve, reject) => {
+    const key = Buffer.from('0123456789abcdef').toString('base64');
+    const sock = connect(port, '127.0.0.1', () => {
+      sock.write(`GET /gyro?role=game&code=BEAT HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+    });
+    let buf = Buffer.alloc(0);
+    sock.on('data', d => { buf = Buffer.concat([buf, d]); if (buf.includes('\r\n\r\n')) resolve(sock); });
+    sock.on('error', reject);
+  });
+  const phone = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=phone&code=BEAT`);
+  const states = [];
+  phone.on('message', m => states.push(JSON.parse(m.toString())));
+  await new Promise((resolve) => phone.once('open', resolve));
+  try {
+    await new Promise(r => setTimeout(r, 900));   // phone joins before round 1; ~6 rounds total
+    assert.deepEqual(states.map(s => s.on), [true, false], `expected paired true then false, got ${JSON.stringify(states)}`);
+  } finally { raw.destroy(); phone.close(); await relay.close(); }
+});
+
+test('gyro heartbeat: a phone that answers pings stays connected', async () => {
+  const { createRelayServer } = await import('./server.mjs');
+  const relay = createRelayServer({ gyroHeartbeatMs: 150 });
+  await new Promise((resolve, reject) => { relay.server.once('error', reject); relay.listen(0, '127.0.0.1', resolve); });
+  const port = relay.address().port;
+  const game = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=game&code=ALIV`);
+  await new Promise((resolve) => game.once('open', resolve));
+  const phone = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=phone&code=ALIV`);
+  let lastState = null;
+  phone.on('message', m => { lastState = JSON.parse(m.toString()); });
+  await new Promise((resolve) => phone.once('open', resolve));
+  try {
+    await new Promise(r => setTimeout(r, 900));   // ws lib auto-pongs: nothing should be dropped
+    assert.equal(game.readyState, WebSocket.OPEN);
+    assert.equal(phone.readyState, WebSocket.OPEN);
+    assert.deepEqual(lastState, { t: 'paired', on: true });
+  } finally { game.close(); phone.close(); await relay.close(); }
+});

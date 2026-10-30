@@ -834,6 +834,26 @@ export function createRelayServer(options = {}) {
     const on = !!(pair.game && pair.game.readyState === WebSocket.OPEN);
     try { pair.phone.send(JSON.stringify({ t: 'paired', on })); } catch {}
   };
+  /* A half-open gyro socket (laptop asleep, wifi dropped, tunnel vanished)
+     never fires 'close', so the pair state would freeze with a dead side
+     looking connected - the phone would keep saying Connected to nothing.
+     Ping both gyro roles on a short clock; a socket that misses a whole round
+     is terminated, which fires 'close' and updates the pair state. The
+     Android app answers pings (MiniWebSocket replies pong to opcode 9) and
+     browsers do it natively. Default 10s: worst-case stale-detection ~20s. */
+  const gyroHeartbeatMs = positiveInteger(options.gyroHeartbeatMs, 10_000);
+  const gyroAlive = new WeakMap();
+  const gyroHeartbeat = setInterval(() => {
+    for (const pair of gyroPairs.values()) {
+      for (const sock of [pair.game, pair.phone]) {
+        if (!sock) continue;
+        if (gyroAlive.get(sock) === false) { try { sock.terminate(); } catch {} continue; }
+        gyroAlive.set(sock, false);
+        try { sock.ping(); } catch {}
+      }
+    }
+  }, gyroHeartbeatMs);
+  gyroHeartbeat.unref?.();
   gyroWss.on('connection', (ws, request) => {
     let role, code;
     try {
@@ -854,6 +874,8 @@ export function createRelayServer(options = {}) {
     console.log(`Gyro: ${isGame ? 'game' : 'phone'} joined code ${code}` +
       ` (game=${!!pair.game} phone=${!!pair.phone})`);
     gyroTellPhone(pair);
+    gyroAlive.set(ws, true);
+    ws.on('pong', () => gyroAlive.set(ws, true));
     ws.on('message', (data) => {
       const target = isGame ? pair.phone : pair.game;
       if (target && target.readyState === WebSocket.OPEN) target.send(data.toString());
@@ -2432,6 +2454,7 @@ export function createRelayServer(options = {}) {
   retryBattlePassAwards();
 
   async function close() {
+    clearInterval(gyroHeartbeat);
     if (heartbeat) clearInterval(heartbeat);
     if (idleSweep) clearInterval(idleSweep);
     /* A planned shutdown is also a match result for every room still in play.
