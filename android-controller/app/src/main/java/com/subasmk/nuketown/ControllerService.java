@@ -100,6 +100,18 @@ public class ControllerService extends Service implements SensorEventListener {
 
     private static double r1(float v) { return Math.round(v * 10) / 10.0; }
 
+    /* Application-level heartbeat: the server cannot trust WebSocket pong
+       frames through an edge proxy, and sensor events are not guaranteed to
+       fire on a still, backgrounded or screen-off phone - so liveness is its
+       own 5s message, independent of sensor flow. */
+    private final Runnable heartbeat = new Runnable() {
+        @Override public void run() {
+            MiniWebSocket w = ws;
+            if (w != null && w.isOpen()) send("{\"t\":\"hb\"}");
+            ui.postDelayed(this, 5000);
+        }
+    };
+
     @Override public void onCreate() {
         super.onCreate();
         inst = this;
@@ -202,6 +214,8 @@ public class ControllerService extends Service implements SensorEventListener {
         else say("This phone has no rotation sensor, so aim cannot work.");
         ui.removeCallbacks(flush);
         ui.post(flush);
+        ui.removeCallbacks(heartbeat);
+        ui.postDelayed(heartbeat, 5000);
     }
 
     private void closeWs() {
@@ -217,6 +231,7 @@ public class ControllerService extends Service implements SensorEventListener {
         if (jumpOn) setAction(false, false);
         sm.unregisterListener(this);
         ui.removeCallbacks(flush);
+        ui.removeCallbacks(heartbeat);
         closeWs();
         if (wake != null && wake.isHeld()) wake.release();
         say(msg);

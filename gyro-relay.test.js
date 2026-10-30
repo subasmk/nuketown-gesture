@@ -141,8 +141,8 @@ test('android app wiring: no gun picker on the phone, sensitivity on both screen
   assert.match(act, /AIM SENSITIVITY/);
   assert.match(svc, /setSens/);
   assert.match(svc, /sens \/ 13f/);
-  assert.match(gradle, /versionCode 6/);
-  assert.match(gradle, /versionName '4\.2'/);
+  assert.match(gradle, /versionCode 7/);
+  assert.match(gradle, /versionName '4\.3'/);
 });
 
 test('gyro pairs are isolated by pairing code (expo: 2 laptops, 2 phones)', async (t) => {
@@ -308,4 +308,28 @@ test('gyro heartbeat: a game sending keepalives (but never ponging) stays connec
     assert.equal(phone.readyState, WebSocket.OPEN);
     assert.deepEqual(lastState, { t: 'paired', on: true });
   } finally { clearInterval(hbTimer); clearInterval(phoneStream); game.destroy(); phone.close(); await relay.close(); }
+});
+
+test('gyro heartbeat: a phone sending only keepalives stays connected and its hb never reaches the game', async () => {
+  const { createRelayServer } = await import('./server.mjs');
+  const relay = createRelayServer({ gyroHeartbeatMs: 150, gyroSilenceMs: 300 });
+  await new Promise((resolve, reject) => { relay.server.once('error', reject); relay.listen(0, '127.0.0.1', resolve); });
+  const port = relay.address().port;
+  const game = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=game&code=HBPH`);
+  const gameGot = [];
+  game.on('message', m => gameGot.push(JSON.parse(m.toString())));
+  await new Promise((resolve) => game.once('open', resolve));
+  const gameHb = setInterval(() => { try { game.send('{"t":"hb"}'); } catch {} }, 100);
+  const phone = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=phone&code=HBPH`);
+  let lastState = null;
+  phone.on('message', m => { lastState = JSON.parse(m.toString()); });
+  await new Promise((resolve) => phone.once('open', resolve));
+  const phoneHb = setInterval(() => { try { phone.send('{"t":"hb"}'); } catch {} }, 100);
+  try {
+    await new Promise(r => setTimeout(r, 900));   // both sides heartbeat-only; both must survive
+    assert.equal(phone.readyState, WebSocket.OPEN, 'hb-only phone should survive');
+    assert.equal(game.readyState, WebSocket.OPEN, 'hb-only game should survive');
+    assert.deepEqual(lastState, { t: 'paired', on: true });
+    assert.deepEqual(gameGot.filter(m => m.t === 'hb'), [], 'hb frames must be consumed, not forwarded');
+  } finally { clearInterval(gameHb); clearInterval(phoneHb); game.close(); phone.close(); await relay.close(); }
 });

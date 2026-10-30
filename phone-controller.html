@@ -29,14 +29,16 @@
 // the trigger (volume up works only on the few browsers that expose it as
 // a key event -- handled at the bottom as a bonus).
 const $=id=>document.getElementById(id);
-let ws=null,last=null,accX=0,accY=0,firing=false,sendTimer=0;
+let ws=null,last=null,accX=0,accY=0,firing=false,sendTimer=0,hbTimer=0;
 const SENS=9; /* mouse-like units per degree of phone tilt */
 function say(t){$('status').textContent=t;}
 function connect(){
   const proto=location.protocol==='https:'?'wss':'ws';
   ws=new WebSocket(proto+'://'+location.host+'/gyro?role=phone');
-  ws.onopen=()=>say('Connected. Tilt phone = turn screen. Hold FIRE to shoot.');
-  ws.onclose=()=>{say('Disconnected. Tap START to reconnect.');ws=null;fireOff();};
+  ws.onopen=()=>{say('Connected. Tilt phone = turn screen. Hold FIRE to shoot.');
+    if(!hbTimer)hbTimer=setInterval(()=>send({t:'hb'}),5000);};
+  ws.onclose=()=>{say('Disconnected. Tap START to reconnect.');ws=null;fireOff();
+    if(hbTimer){clearInterval(hbTimer);hbTimer=0;}};
   ws.onerror=()=>{};
 }
 function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}

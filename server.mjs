@@ -844,13 +844,14 @@ export function createRelayServer(options = {}) {
   const gyroHeartbeatMs = positiveInteger(options.gyroHeartbeatMs, 10_000);
   const gyroAlive = new WeakMap();
   /* An edge proxy can answer WebSocket pings on a dead client's behalf (and
-     never deliver the server's pings to a live one), so pong frames prove
-     nothing through a proxy. Only an application message is unforgeable
-     proof of life: the game page sends {"t":"hb"} every 5s and the Android
-     app streams sensor messages constantly while its controller service is
-     up. Either side silent for gyroSilenceMs is terminated, which fires
-     'close' and updates the pair state. Pings are still sent as harmless
-     NAT/proxy keepalives, but never used to judge liveness. */
+     never deliver the server's pings to a live one) - observed against the
+     Render deployment - so pong frames are not reliable proof of life there.
+     The contract is an application-level heartbeat: every client (game page,
+     Android app, legacy browser page) sends {"t":"hb"} every 5s, independent
+     of sensor activity, so a motionless phone is still provably alive.
+     Either side silent for gyroSilenceMs (20s default) is terminated, which
+     fires 'close' and updates the pair state. Pings are still sent as
+     harmless NAT/proxy keepalives, but never used to judge liveness. */
   const gyroSilenceMs = positiveInteger(options.gyroSilenceMs, 20_000);
   const gyroHeartbeat = setInterval(() => {
     const nowMs = Date.now();
@@ -892,11 +893,9 @@ export function createRelayServer(options = {}) {
     gyroAlive.set(ws, true);
     ws.on('pong', () => gyroAlive.set(ws, true));
     ws.on('message', (data) => {
-      if (isGame) {
-        pair.gameMsgAt = Date.now();
-        /* Keepalive frames are liveness proof, not phone input. */
-        try { const m = JSON.parse(data.toString()); if (m && m.t === 'hb') return; } catch {}
-      } else pair.phoneMsgAt = Date.now();
+      /* Keepalive frames from either side are liveness proof, not input. */
+      try { const m = JSON.parse(data.toString()); if (m && m.t === 'hb') { if (isGame) pair.gameMsgAt = Date.now(); else pair.phoneMsgAt = Date.now(); return; } } catch {}
+      if (isGame) pair.gameMsgAt = Date.now(); else pair.phoneMsgAt = Date.now();
       const target = isGame ? pair.phone : pair.game;
       if (target && target.readyState === WebSocket.OPEN) target.send(data.toString());
     });
