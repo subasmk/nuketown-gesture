@@ -20,6 +20,8 @@
   #fireBtn.on { background:#ff6b4a; }
   #jumpBtn { right:22%; bottom:8%; width:74px; height:74px; background:#2f7fe3dd; font-size:13px; }
   #hint { position:absolute; bottom:4px; left:0; right:0; text-align:center; font-size:11px; color:#7d93a9; }
+  #sensBar { position:absolute; top:44px; left:0; right:0; display:flex; justify-content:center; align-items:center; gap:8px; font-size:12px; color:#9fb4c8; }
+  #sensBar input { width:140px; accent-color:#ffd23e; }
 </style>
 </head>
 <body>
@@ -28,11 +30,12 @@
   <p>The laptop screen shows a 4-letter code.<br>Type it here:</p>
   <input id="code" maxlength="6" autocomplete="off" autocapitalize="characters">
   <p><button id="connect">CONNECT + ENABLE GYRO</button></p>
-  <div id="status">Same Wi-Fi/hotspot as the laptop. Hold the phone sideways, like a gun.</div>
+  <div id="status">Works over the internet - no same-Wi-Fi needed. Hold the phone sideways, like a gun.</div>
 </div>
 
 <div id="ctl">
   <div id="topbar"><span id="ctlStatus">connected</span><span>🔊 Android: VOL UP = fire · VOL DOWN = jump</span></div>
+  <div id="sensBar"><label for="sens">Aim sensitivity</label><input id="sens" type="range" min="0.3" max="2.5" step="0.1" value="1"><span id="sensVal">1.0×</span></div>
   <div id="joyZone"><div id="joyNub"></div></div>
   <button class="rbtn" id="jumpBtn">JUMP</button>
   <button class="rbtn" id="fireBtn">FIRE</button>
@@ -45,11 +48,11 @@
 'use strict';
 const V = 11; // net-protocol VERSION
 let ws = null, code = '', latest = { a: 0, b: 0, g: 0 }, haveGyro = false;
-let joy = [0, 0], firing = false, jumpPulse = false, volFireUntil = 0;
+let joy = [0, 0], firing = false, jumpPulse = false, volFireUntil = 0, sens = 1;
 const $ = id => document.getElementById(id);
 
 function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
-function sendState() { send({ t: 'ctl', v: V, o: [latest.a, latest.b, latest.g], s: (screen.orientation && screen.orientation.angle) || 0, j: joy, f: firing || performance.now() < volFireUntil ? 1 : 0, jump: jumpPulse ? 1 : 0 }); jumpPulse = false; }
+function sendState() { send({ t: 'ctl', v: V, o: [latest.a, latest.b, latest.g], s: (screen.orientation && screen.orientation.angle) || 0, j: joy, f: firing || performance.now() < volFireUntil ? 1 : 0, jump: jumpPulse ? 1 : 0, sn: sens }); jumpPulse = false; }
 
 async function connect() {
   code = $('code').value.trim().toUpperCase();
@@ -131,7 +134,17 @@ function startVolumeEar() {
   });
 }
 
+$('sens').addEventListener('input', e => { sens = parseFloat(e.target.value) || 1; $('sensVal').textContent = sens.toFixed(1) + '×'; });
 $('connect').addEventListener('click', connect);
+/* Connect as soon as the 4-letter code is typed - no extra tap needed.
+   The button stays for retries. Typing is a user gesture, so the iOS
+   motion-permission prompt inside connect() still works. */
+let autoTried = false;
+$('code').addEventListener('input', e => {
+  e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (e.target.value.length < 4) { autoTried = false; return; }
+  if (!autoTried) { autoTried = true; connect(); }
+});
 setInterval(sendState, 50); // 20 Hz state stream
 </script>
 </body>
