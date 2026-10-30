@@ -185,3 +185,60 @@ console.log('PASS pause gates phone input');
   ctx.G.player.alive = true;
   console.log('PASS weapon select: slots map to the real guns, invalid/paused/dead ignored');
 }
+
+// 9. Wrap-around: crossing the +-180 line chases the SHORT way (+2 deg, not -358).
+{
+  let total = 0;
+  ctx.applyLook = (dx) => { total += dx; };
+  PHONE.aim = { yaw: 179, pitch: 0 }; PHONE.applied = { yaw: 179, pitch: 0 };
+  PHONE.last = now; PHONE.liveUntil = now + 1500;
+  PHONE.aim = { yaw: -179, pitch: 0 };           // phone rotated +2 deg across the boundary
+  for (let i = 0; i < 120; i++) phoneTick(1 / 60);
+  const k = Math.PI / 180 / 0.0021;
+  const movedDeg = -total / k;                    // applyLook yaw -= dx: positive turn = negative dx
+  assert(Math.abs(movedDeg + 2) < 0.05, `wrap should move exactly like an unwrapped +2 deg turn (movedDeg=-2), got ${movedDeg}`);
+  console.log('PASS wrap-around chases the short way:', movedDeg.toFixed(3), 'deg');
+}
+
+// 10. Long session: 60 simulated seconds of continuous 10 deg/s rotation with wraps.
+{
+  let total = 0, bad = 0;
+  ctx.applyLook = (dx) => { total += dx; if (!isFinite(dx)) bad++; };
+  PHONE.aim = { yaw: 0, pitch: 0 }; PHONE.applied = { yaw: 0, pitch: 0 };
+  PHONE.last = now; PHONE.liveUntil = now + 70000;
+  let target = 0;
+  const k = Math.PI / 180 / 0.0021;
+  for (let f = 0; f < 3600; f++) {                // 60 s at 60 fps
+    if (f % 3 === 0) {                            // aim messages at 20 Hz
+      target += 10 / 20;
+      let yaw = ((target + 180) % 360 + 360) % 360 - 180;
+      PHONE.aim = { yaw, pitch: 0 }; PHONE.last = now + f * 16.7; PHONE.liveUntil = now + 70000;
+    }
+    phoneTick(1 / 60);
+  }
+  const movedDeg = -total / k;
+  assert.strictEqual(bad, 0, 'no NaN frames');
+  assert(Math.abs(movedDeg + 600) < 1.5, `60 s at 10 deg/s should move ~600 deg, got ${movedDeg}`);
+  console.log('PASS long session tracks 600 deg with wraps:', movedDeg.toFixed(2), 'deg');
+}
+
+// 11. Variable message rate (5 Hz then 100 Hz) stays stable and converges.
+{
+  let total = 0;
+  ctx.applyLook = (dx) => { total += dx; };
+  PHONE.aim = { yaw: 0, pitch: 0 }; PHONE.applied = { yaw: 0, pitch: 0 };
+  PHONE.last = now; PHONE.liveUntil = now + 15000;
+  const k = Math.PI / 180 / 0.0021;
+  for (let f = 0; f < 120; f++) {                 // 2 s at 5 Hz
+    if (f % 12 === 0) PHONE.aim = { yaw: (f / 12) * 2, pitch: 0 };
+    phoneTick(1 / 60);
+  }
+  for (let f = 0; f < 120; f++) {                 // 2 s at 100 Hz (~2 msgs/frame)
+    PHONE.aim = { yaw: 20 + f * 0.5, pitch: 0 };
+    phoneTick(1 / 60);
+  }
+  for (let f = 0; f < 60; f++) phoneTick(1 / 60);   // settle: chase catches up
+  const movedDeg = -total / k;
+  assert(Math.abs(movedDeg + 79.5) < 1.0, `variable-rate turn should land ~79.5 deg, got ${movedDeg}`);
+  console.log('PASS variable message rate converges:', movedDeg.toFixed(2), 'deg');
+}

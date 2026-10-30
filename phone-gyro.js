@@ -29,7 +29,12 @@ function phoneTick(dt) {
     if (dyaw > 180) dyaw -= 360; else if (dyaw < -180) dyaw += 360;
     const dpitch = PHONE.aim.pitch - PHONE.applied.pitch;
     const sy = dyaw * chase, sp = dpitch * chase;
-    PHONE.applied = { yaw: PHONE.applied.yaw + sy, pitch: PHONE.applied.pitch + sp };
+    /* applied must stay wrapped like the incoming aim: accumulate past
+       +-180 unwrapped and dyaw collapses to 0 after one full turn, so a
+       long spin would freeze the camera. */
+    let ay = PHONE.applied.yaw + sy;
+    if (ay > 180) ay -= 360; else if (ay < -180) ay += 360;
+    PHONE.applied = { yaw: ay, pitch: PHONE.applied.pitch + sp };
     if (sy || sp) {
       const k = Math.PI / 180 / mouseSens; /* game look units per degree */
       applyLook(sy * k, -sp * k, mouseSens);
