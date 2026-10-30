@@ -64,6 +64,10 @@ public class ControllerService extends Service implements SensorEventListener {
     private boolean needRef = true, sendReset = true;
     private float refAz, refPitch, curYaw, curPitch;
     private boolean haveAim;
+    // POINT smoothing: raw sensor angles jitter; an EMA keeps the reticle steady
+    // without noticeable lag (alpha chosen for the 25 Hz flush).
+    private boolean haveSmooth;
+    private float smYaw, smPitch;
 
     /** Pure math, unit-tested by hand in docs: wrap an angle difference into [-180, 180]. */
     static float wrap(float d) {
@@ -109,7 +113,8 @@ public class ControllerService extends Service implements SensorEventListener {
         String host = in.getStringExtra("host");
         int port = in.getIntExtra("port", 8080);
         boolean tls = in.getBooleanExtra("tls", true);
-        connect(host, port, tls);
+        String code = in.getStringExtra("code");
+        connect(host, port, tls, code);
         return START_NOT_STICKY;
     }
 
@@ -131,6 +136,7 @@ public class ControllerService extends Service implements SensorEventListener {
     public void centre() {
         needRef = true; sendReset = true; haveAim = false;
         haveLast = false; accX = accY = 0;
+        haveSmooth = false;
     }
 
     private void goForeground() {
@@ -161,12 +167,13 @@ public class ControllerService extends Service implements SensorEventListener {
         if (l != null) ui.post(l);
     }
 
-    private void connect(String host, int port, boolean tls) {
+    private void connect(String host, int port, boolean tls, String code) {
         closeWs();
         say("Connecting to " + host + ":" + port + " ...");
         centre();
         final MiniWebSocket[] holder = new MiniWebSocket[1];
-        holder[0] = new MiniWebSocket(host, port, tls, "/gyro?role=phone", new MiniWebSocket.Listener() {
+        String path = "/gyro?role=phone" + (code == null || code.isEmpty() ? "" : "&code=" + code);
+        holder[0] = new MiniWebSocket(host, port, tls, path, new MiniWebSocket.Listener() {
             @Override public void onOpen() {
                 ui.post(() -> { if (ws == holder[0]) { connected = true;
                     say("Connected. Aim mode: " + (mode == MODE_POINT ? "POINT" : "TILT") + ". (Tap CONNECT PHONE in the game first.)"); } });
@@ -215,13 +222,6 @@ public class ControllerService extends Service implements SensorEventListener {
         net.execute(() -> w.sendText(m));
     }
 
-    /** Gun select from the app's weapon cards: 1 = BUBBLEGUN, 2 = MARSHMALLOW, 3 = LOLLIPOP
-        (the same slots the game's 1/2/3 keys use). */
-    public void setWeapon(int slot) {
-        if (slot < 1 || slot > 3) return;
-        send("{\"t\":\"weapon\",\"slot\":" + slot + "}");
-    }
-
     public void setAction(boolean isFire, boolean on) {
         if (isFire) { if (fireOn == on) return; fireOn = on; send("{\"t\":\"fire\",\"on\":" + on + "}"); }
         else { if (jumpOn == on) return; jumpOn = on; send("{\"t\":\"jump\",\"on\":" + on + "}"); }
@@ -238,8 +238,19 @@ public class ControllerService extends Service implements SensorEventListener {
         if (w == null || !w.isOpen()) return;
         if (mode == MODE_POINT) {
             if (needRef) { refAz = az; refPitch = pitch; needRef = false; }
-            curYaw = wrap(az - refAz);                  // point right = positive
-            curPitch = clampPitch(-(pitch - refPitch)); // point up = positive
+            /* The sensitivity slider used to do nothing in this mode - the raw
+               angle went straight to the view. Scale around the 13 default so
+               13 is exactly the old 1:1 feel, and smooth the sensor jitter. */
+            float k = sens / 13f;
+            float ty = wrap(az - refAz) * k;                  // point right = positive
+            float tp = clampPitch(-(pitch - refPitch) * k);   // point up = positive
+            if (!haveSmooth) { smYaw = ty; smPitch = tp; haveSmooth = true; }
+            else {
+                smYaw += wrap(ty - smYaw) * 0.35f;
+                smPitch += (tp - smPitch) * 0.35f;
+            }
+            curYaw = smYaw;
+            curPitch = clampPitch(smPitch);
             haveAim = true;
             return;
         }
