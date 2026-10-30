@@ -18,7 +18,11 @@ const NETP = globalThis.NUKETOWN_PROTOCOL;
    Leave it empty to talk to whatever origin served the page — that is the
    right answer when the relay is also serving the game. A ?server= in the
    URL overrides it either way. */
-const NET_SERVER = 'relay.luckeysystems.com';
+/* Hosted builds serve the game and the relay from the same origin; the
+   upstream public relay is not part of this deployment. Empty string makes
+   netWsURL() fall back to the same-origin socket. LAN play is unaffected:
+   private origins already return the same-origin URL before this. */
+const NET_SERVER = '';
 const NET_SNAPSHOT_INTERVAL = 1 / 20;
 /* Events leave on their own clock so hit feedback does not wait for the next
    snapshot. Faster than snapshots because they are small and latency-critical,
