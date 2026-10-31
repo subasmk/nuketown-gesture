@@ -143,6 +143,17 @@
         <input type="checkbox" id="invertY">
         <span>INVERT LOOK (Y)</span>
       </label>
+      <!-- Webcam aim/move next to the other look settings, on the pause card
+           included: without setup-only the column shows it there, which is
+           where a player mid-match goes looking for it. One click runs the
+           same camera flow as the floating panel's ENABLE CAMERA - the
+           browser asks for the camera on that click and never before. The
+           note mirrors the panel's status line; gesture-bridge.js wires
+           both. -->
+      <div class="listed webcam-connect">
+        <button class="mini-btn" id="menuCamStart" type="button">ENABLE CAMERA</button>
+        <span id="menuCamNote">WEBCAM: OFF</span>
+      </div>
     </div>
     <!-- Whoever is being worn, drawn once by the locker's display case into a
          still. Hidden until there is one: a browser that cannot give the

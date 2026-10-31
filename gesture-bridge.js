@@ -21,7 +21,10 @@ addEventListener('DOMContentLoaded',()=>{
  const box=document.createElement('section');box.id='gesture-panel';box.style.cssText='position:fixed;left:8px;bottom:8px;z-index:100000;width:230px;padding:8px;background:#182431ed;color:white;font:12px system-ui;border-radius:10px';
  box.innerHTML='<b>GESTURE CONTROL</b><br><details><summary>Camera preview (expand)</summary><video id="gesture-video" autoplay muted playsinline style="width:100%;max-height:130px;transform:scaleX(-1)"></video></details><div id="gesture-note" role="status">Camera off. Click ENABLE CAMERA.</div><button id="gesture-start">ENABLE CAMERA</button> <button id="gesture-neutral">SET NEUTRAL</button> <button id="gesture-moveonly">MOVE ONLY: OFF</button><br>C recenter | F8 pause gestures<br>One hand: fingertip aims, light pinch = FIRE (hold to keep firing)<br>Second hand: palm moves (raise = forward)<br>MOVE ONLY: 1=front 2=back 3=right 4=left; fist/no hand=stop<br>R reload | Space jump | 1/2/3 weapons';document.body.append(box);
  const note=document.getElementById('gesture-note');
- document.getElementById('gesture-start').onclick=()=>{
+ /* One camera flow behind both switches: the floating panel's ENABLE CAMERA
+    and the settings row on the pause card. Permission behavior is unchanged -
+    the camera is asked for on this click and nowhere else. */
+ const startCam=()=>{
   GESTURE.enabled=true;
   if(!window.GestureControl){note.textContent='Gesture script missing';return;}
   GestureControl.start(document.getElementById('gesture-video'),{
@@ -36,6 +39,19 @@ addEventListener('DOMContentLoaded',()=>{
    onStatus:t=>{note.textContent=t;}
   });
  };
+ document.getElementById('gesture-start').onclick=startCam;
+ /* The settings row (#menuCamStart) runs the identical flow and mirrors the
+    panel's status line, so the pause card always says what the camera is
+    doing without owning any of the logic. */
+ const menuBtn=document.getElementById('menuCamStart'),menuNote=document.getElementById('menuCamNote');
+ if(menuBtn)menuBtn.onclick=startCam;
+ if(menuNote){
+  const mirror=()=>{menuNote.textContent='WEBCAM: '+note.textContent;};
+  if(typeof MutationObserver==='function'){
+    new MutationObserver(mirror).observe(note,{childList:true,characterData:true,subtree:true});
+    mirror();
+  }
+ }
  document.getElementById('gesture-neutral').onclick=()=>{gestureStop();GestureControl.capture();};
  /* Move-only mode: while a phone is connected it aims and fires, so the
     webcam hand switches to finger-count movement. Automatic on phone

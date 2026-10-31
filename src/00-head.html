@@ -615,7 +615,11 @@ body.touch .sens{display:none}
    small screens): they only appear while the settings popover is open. */
 #ctl-panel,#phone-panel,#gesture-panel{display:none}
 body[data-settings-open] #ctl-panel,body[data-settings-open] #phone-panel,body[data-settings-open] #gesture-panel{display:block}
-#title.hud .menu-settings .sens,#title.hud .menu-settings .look-invert{width:100%}
+#title.hud .menu-settings .sens,#title.hud .menu-settings .look-invert,
+#title.hud .menu-settings .webcam-connect{width:100%}
+.menu-settings .webcam-connect{cursor:default}
+.menu-settings #menuCamStart{flex:none;padding:6px 12px 7px;font-size:11px;min-height:36px}
+.menu-settings #menuCamNote{line-height:1.35}
 
 /* ---- the two rails ---- */
 #title.hud .locker{grid-area:lft}
