@@ -71,3 +71,5 @@ Studio. Debug APK: `app/build/outputs/apk/debug/app-debug.apk`. Sideload by allo
 - The browser controller at /controller gains the same sensitivity slider (sent to the game as a
   multiplier on its fixed aim rate) and no longer claims you need the same Wi-Fi - the deployed
   game link works over the internet.
+
+Note: Render build filter ignores this directory (android-controller/**); pushes here do not redeploy the web service.
