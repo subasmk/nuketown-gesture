@@ -25,6 +25,17 @@ Studio. Debug APK: `app/build/outputs/apk/debug/app-debug.apk`. Sideload by allo
   on re-centre); the game turns the camera by the difference, so pointing back returns the view.
   Yaw drifts slowly with the phone's gyro: tap RE-CENTRE when it wanders.
 - **AIM MODE: TILT**: the old behaviour (turn speed moves the view, `{"t":"look",...}`).
+
+## v4.4: AIR MOUSE aim (experimental, optional)
+
+- **AIM MODE: AIR MOUSE**: slide the whole phone through the air to move the view. Whole-phone
+  translation, not rotation: ARCore (Google Play Services for AR, free from the Play Store) tracks
+  the camera pose and turns hand movement into the same `{"t":"look",...}` deltas TILT uses.
+- The camera turns on ONLY in this mode, after the Android permission prompt, and turns off when
+  you switch modes or leave the app. Video is processed on the phone; nothing is uploaded.
+- Needs an ARCore-supported phone and decent light. Tracking state (tracking / lost / camera off)
+  is shown in the app; RE-CENTRE resets the reference position. No fallback fakes motion from the
+  gyro: if ARCore cannot track, AIR MOUSE says so instead of pretending.
 - **Screen off**: a foreground service plus partial wake lock keep the connection and aim streaming
   with the screen off (a notification shows while running). Android does not deliver the volume
   buttons to apps while the screen is off, so volume-key fire/jump need the screen on. Leave

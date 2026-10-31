@@ -119,6 +119,37 @@ test('android app wiring: POINT/TILT toggle, re-centre, foreground service with 
   assert.match(act, /KEYCODE_VOLUME_DOWN/);
 });
 
+test('android app wiring: AIR MOUSE is optional ARCore, camera gated, no fake fallback', async () => {
+  const fs = await import('node:fs');
+  const dir = new URL('./android-controller/app/', import.meta.url);
+  const mf = fs.readFileSync(new URL('src/main/AndroidManifest.xml', dir), 'utf8');
+  const act = fs.readFileSync(new URL('src/main/java/com/subasmk/nuketown/MainActivity.java', dir), 'utf8');
+  const svc = fs.readFileSync(new URL('src/main/java/com/subasmk/nuketown/ControllerService.java', dir), 'utf8');
+  const air = fs.readFileSync(new URL('src/main/java/com/subasmk/nuketown/AirMouse.java', dir), 'utf8');
+  const gradle = fs.readFileSync(new URL('build.gradle', dir), 'utf8');
+  /* Optional AR: the app installs and gyro modes run without ARCore or a
+     camera; the dependency is declared optional in the manifest. */
+  assert.match(mf, /android\.permission\.CAMERA/);
+  assert.match(mf, /android\.hardware\.camera\.ar" android:required="false"/);
+  assert.match(mf, /com\.google\.ar\.core" android:value="optional"/);
+  assert.match(gradle, /com\.google\.ar:core:/);
+  /* Camera opens only from the AIR MOUSE path: permission is requested when
+     the user picks the mode, never at startup. onCreate must not request it. */
+  assert.match(act, /MODE_AIR/);
+  assert.match(act, /requestPermissions\(new String\[\]\{Manifest\.permission\.CAMERA\}/);
+  const onCreate = act.slice(act.indexOf('protected void onCreate'), act.indexOf('buildSetupPanel(sp);'));
+  assert.doesNotMatch(onCreate, /CAMERA/);
+  /* The tracker is real ARCore pose only: no sensor fusion and no rotation
+     fallback that would fake translation. */
+  assert.match(air, /com\.google\.ar\.core\.Session/);
+  assert.match(air, /TrackingState\.TRACKING/);
+  assert.doesNotMatch(air, /android\.hardware\.Sensor/);
+  assert.doesNotMatch(air, /HttpURLConnection|Socket|okhttp/);
+  /* The service carries AIR deltas through the same look messages as TILT. */
+  assert.match(svc, /MODE_AIR = 2/);
+  assert.match(svc, /addLook/);
+});
+
 test('android app wiring: no gun picker on the phone, sensitivity on both screens', async () => {
   const fs = await import('node:fs');
   const dir = new URL('./android-controller/app/', import.meta.url);
@@ -141,6 +172,6 @@ test('android app wiring: no gun picker on the phone, sensitivity on both screen
   assert.match(act, /AIM SENSITIVITY/);
   assert.match(svc, /setSens/);
   assert.match(svc, /sens \/ 13f/);
-  assert.match(gradle, /versionCode 7/);
-  assert.match(gradle, /versionName '4.3'/);
+  assert.match(gradle, /versionCode 8/);
+  assert.match(gradle, /versionName '4\.4'/);
 });

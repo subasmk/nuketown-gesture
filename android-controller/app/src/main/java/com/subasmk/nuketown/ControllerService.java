@@ -31,12 +31,15 @@ import java.util.concurrent.Executors;
  *   POINT: absolute. The direction the phone points = where the camera looks,
  *          relative to the RE-CENTRE reference. Sends {"t":"aim","yaw":deg,"pitch":deg}.
  *   TILT : relative. Phone turn speed moves the view. Sends {"t":"look","dx":..,"dy":..}.
+ *   AIR MOUSE: relative. ARCore camera pose tracks the phone moving through
+ *          space; MainActivity owns the camera and feeds deltas via addLook(),
+ *          which go out as the same "look" messages TILT uses. No camera here.
  */
 public class ControllerService extends Service implements SensorEventListener {
     public static final String ACTION_CONNECT = "connect";
     public static final String ACTION_STOP = "stop";
     public static final String PREFS = "nuketown";
-    public static final int MODE_POINT = 0, MODE_TILT = 1;
+    public static final int MODE_POINT = 0, MODE_TILT = 1, MODE_AIR = 2;
     public static final float PITCH_LIMIT = 80f;
 
     /** Set while the service is alive. Used by the activity. */
@@ -144,7 +147,15 @@ public class ControllerService extends Service implements SensorEventListener {
         centre();
     }
     public void setSens(float s) { sens = s; }
+    public float sensNow() { return sens; }
     public int getMode() { return mode; }
+
+    /* AIR MOUSE input from MainActivity's ARCore tracker: translation deltas
+       (already sensitivity-scaled degrees) join the same accumulator TILT
+       uses, so one 50 Hz flush and one message shape serve both. */
+    public void addLook(final float dx, final float dy) {
+        ui.post(() -> { if (mode == MODE_AIR) { accX += dx; accY += dy; } });
+    }
 
     /** RE-CENTRE: the next sensor sample becomes "straight ahead". */
     public void centre() {
@@ -199,7 +210,7 @@ public class ControllerService extends Service implements SensorEventListener {
                         org.json.JSONObject m = new org.json.JSONObject(text);
                         if (!"paired".equals(m.optString("t"))) return;
                         paired = m.optBoolean("on");
-                        if (paired) say("Paired with the laptop. Aim mode: " + (mode == MODE_POINT ? "POINT" : "TILT") + ".");
+                        if (paired) say("Paired with the laptop. Aim mode: " + (mode == MODE_POINT ? "POINT" : mode == MODE_AIR ? "AIR MOUSE" : "TILT") + ".");
                         else say("The laptop stopped listening - in the game open Settings and tap CONNECT PHONE again.");
                     } catch (Exception ignored) {}
                 });
@@ -269,6 +280,7 @@ public class ControllerService extends Service implements SensorEventListener {
         float pitch = (float) Math.toDegrees(O[1]);
         MiniWebSocket w = ws;
         if (w == null || !w.isOpen()) return;
+        if (mode == MODE_AIR) return; // camera tracker owns aim in AIR MOUSE
         if (mode == MODE_POINT) {
             if (needRef) { refAz = az; refPitch = pitch; needRef = false; }
             /* The sensitivity slider used to do nothing in this mode - the raw

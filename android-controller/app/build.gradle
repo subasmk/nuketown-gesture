@@ -6,8 +6,8 @@ android {
         applicationId 'com.subasmk.nuketown.controller'
         minSdk 24
         targetSdk 34
-        versionCode 7
-        versionName '4.3'
+        versionCode 8
+        versionName '4.4'
     }
     /* The debug key is no longer committed: the old one leaked with the public
        repo, so v4.0 signs with a fresh local key (installs need one uninstall of
@@ -23,4 +23,9 @@ android {
     }
     buildTypes { debug { signingConfig signingConfigs.debug } }
     compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+}
+dependencies {
+    /* AIR MOUSE mode only: camera pose tracking. Optional - POINT and TILT
+       (gyro) work without it and without the camera ever turning on. */
+    implementation 'com.google.ar:core:1.45.0'
 }

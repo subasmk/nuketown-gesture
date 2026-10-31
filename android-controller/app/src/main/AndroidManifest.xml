@@ -7,6 +7,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
+    <!-- Air Mouse is optional: the app installs and gyro modes work without a
+         camera or ARCore; the camera turns on only in AIR MOUSE mode. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.ar" android:required="false" />
+    <uses-feature android:glEsVersion="0x00020000" android:required="false" />
     <application
         android:label="Nuketown Controller"
         android:allowBackup="false"
@@ -22,6 +27,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <meta-data android:name="com.google.ar.core" android:value="optional" />
         <service
             android:name=".ControllerService"
             android:exported="false"

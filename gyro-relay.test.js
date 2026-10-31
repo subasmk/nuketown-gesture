@@ -141,8 +141,8 @@ test('android app wiring: no gun picker on the phone, sensitivity on both screen
   assert.match(act, /AIM SENSITIVITY/);
   assert.match(svc, /setSens/);
   assert.match(svc, /sens \/ 13f/);
-  assert.match(gradle, /versionCode 7/);
-  assert.match(gradle, /versionName '4\.3'/);
+  assert.match(gradle, /versionCode 8/);
+  assert.match(gradle, /versionName '4\.4'/);
 });
 
 test('gyro pairs are isolated by pairing code (expo: 2 laptops, 2 phones)', async (t) => {

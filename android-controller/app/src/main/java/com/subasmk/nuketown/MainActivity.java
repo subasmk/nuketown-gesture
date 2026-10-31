@@ -1,7 +1,9 @@
 package com.subasmk.nuketown;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -26,6 +28,10 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
+import android.opengl.GLSurfaceView;
+
+import com.google.ar.core.ArCoreApk;
+import com.google.ar.core.exceptions.UnavailableException;
 
 /**
  * Nuketown phone controller (native).
@@ -60,10 +66,16 @@ public class MainActivity extends Activity {
     private Button connectBtn, centreBtn, modeBtn;
     private final SeekBar[] sensBars = new SeekBar[2];
     private final TextView[] sensLabels = new TextView[2];
-    private LinearLayout setupPanel, controlPanel;
+    private LinearLayout setupPanel, controlPanel, root;
     private float sens = 13f;
     private int mode = ControllerService.MODE_POINT;
     private boolean fireOn, jumpOn;
+    /* AIR MOUSE: created only when the user picks the mode; camera opens only
+       after the OS permission grant, and closes on mode switch / background. */
+    private AirMouse air;
+    private GLSurfaceView airView;
+    private TextView airStatus;
+    private static final int REQ_CAMERA = 42;
 
     private final Runnable refresh = () -> {
         boolean live = ControllerService.inst != null && ControllerService.connected && ControllerService.paired;
@@ -99,7 +111,7 @@ public class MainActivity extends Activity {
         scroll.setFillViewport(true);
         scroll.setBackgroundColor(BG);
 
-        LinearLayout root = new LinearLayout(this);
+        root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(20), dp(28), dp(20), dp(20));
         scroll.addView(root);
@@ -114,6 +126,10 @@ public class MainActivity extends Activity {
         status.setPadding(0, dp(14), 0, dp(6));
         root.addView(status);
 
+        airStatus = text("", 13, false, ACCENT);
+        airStatus.setVisibility(View.GONE);
+        root.addView(airStatus);
+
         setupPanel = new LinearLayout(this);
         setupPanel.setOrientation(LinearLayout.VERTICAL);
         root.addView(setupPanel);
@@ -125,6 +141,12 @@ public class MainActivity extends Activity {
 
         buildSetupPanel(sp);
         buildControlPanel();
+        if (mode == ControllerService.MODE_AIR) {
+            /* Saved from last session: the camera still needs a fresh foreground
+               start, so show the state honestly instead of a dead mode. */
+            airStatus.setVisibility(View.VISIBLE);
+            airStatus.setText("AIR MOUSE selected - camera starts when you tap AIM MODE.");
+        }
 
         setContentView(scroll);
     }
@@ -188,13 +210,7 @@ public class MainActivity extends Activity {
         aimCard.addView(sectionTitle("AIM"));
 
         modeBtn = flatButton("", ACCENT);
-        modeBtn.setOnClickListener(v -> {
-            mode = mode == ControllerService.MODE_POINT ? ControllerService.MODE_TILT : ControllerService.MODE_POINT;
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt("mode", mode).apply();
-            ControllerService c = ControllerService.inst;
-            if (c != null) c.setMode(mode);
-            modeText();
-        });
+        modeBtn.setOnClickListener(v -> cycleMode());
         aimCard.addView(modeBtn);
         modeText();
 
@@ -202,6 +218,7 @@ public class MainActivity extends Activity {
         centreBtn.setOnClickListener(v -> {
             ControllerService c = ControllerService.inst;
             if (c != null) c.centre();
+            if (air != null) air.recenter();
             say("Re-centred. This direction is now straight ahead.");
         });
         aimCard.addView(centreBtn);
@@ -217,7 +234,8 @@ public class MainActivity extends Activity {
             "VOLUME DOWN = JUMP\n" +
             "Switch guns on the laptop keyboard: 1/2/3.\n\n" +
             "POINT aim: where the phone points is where you look, like a laser pointer. Hold it upright, back camera at the laptop screen, tap RE-CENTRE. It drifts slowly, so tap RE-CENTRE whenever it wanders.\n" +
-            "TILT aim: turning the phone moves the view (old behaviour).\n\n" +
+            "TILT aim: turning the phone moves the view (old behaviour).\n" +
+            "AIR MOUSE aim (experimental): slide the whole phone through the air to move the view - needs decent light. Uses the camera with Google Play Services for AR; video is processed on the phone and never uploaded. The camera turns on ONLY in this mode.\n\n" +
             "SCREEN OFF: aim keeps streaming (a notification shows). Android does not deliver the volume buttons with the screen off, so fire/jump need the screen ON. Leave 'Keep screen on' ticked.", 13, false, DIM));
         CheckBox keep = new CheckBox(this);
         keep.setText("Keep screen on (recommended for volume-key fire/jump)");
@@ -264,6 +282,7 @@ public class MainActivity extends Activity {
         re.setOnClickListener(v -> {
             ControllerService c = ControllerService.inst;
             if (c != null) c.centre();
+            if (air != null) air.recenter();
             say("Re-centred. This direction is now straight ahead.");
         });
         Button off = flatButton("DISCONNECT", FIRE_C);
@@ -375,7 +394,93 @@ public class MainActivity extends Activity {
     private void say(final String s) { ui.post(() -> status.setText(s)); }
 
     private void modeText() {
-        modeBtn.setText("AIM MODE: " + (mode == ControllerService.MODE_POINT ? "POINT  ·  tap for TILT" : "TILT  ·  tap for POINT"));
+        String label = mode == ControllerService.MODE_POINT ? "POINT  ·  tap for TILT"
+            : mode == ControllerService.MODE_TILT ? "TILT  ·  tap for AIR MOUSE"
+            : "AIR MOUSE (camera)  ·  tap for POINT";
+        modeBtn.setText("AIM MODE: " + label);
+    }
+
+    /* ---------------- AIR MOUSE (ARCore, camera, optional) ---------------- */
+
+    private void cycleMode() {
+        int next = mode == ControllerService.MODE_POINT ? ControllerService.MODE_TILT
+            : mode == ControllerService.MODE_TILT ? ControllerService.MODE_AIR
+            : ControllerService.MODE_POINT;
+        if (next == ControllerService.MODE_AIR) { tryEnableAir(); return; }
+        applyMode(next);
+    }
+
+    private void applyMode(int m) {
+        mode = m;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt("mode", m).apply();
+        ControllerService c = ControllerService.inst;
+        if (c != null) c.setMode(m);
+        if (m != ControllerService.MODE_AIR) stopAir();
+        airStatus.setVisibility(m == ControllerService.MODE_AIR ? View.VISIBLE : View.GONE);
+        modeText();
+    }
+
+    private void tryEnableAir() {
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            say("AIR MOUSE tracks the phone moving through the air with the camera. Android will now ask for camera permission; POINT and TILT never use the camera.");
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, REQ_CAMERA);
+            return;
+        }
+        ensureArCoreAndStart();
+    }
+
+    @Override public void onRequestPermissionsResult(int req, String[] perms, int[] grants) {
+        super.onRequestPermissionsResult(req, perms, grants);
+        if (req != REQ_CAMERA) return;
+        if (grants.length > 0 && grants[0] == PackageManager.PERMISSION_GRANTED) ensureArCoreAndStart();
+        else say("Camera permission declined - AIR MOUSE stays off. POINT and TILT still work.");
+    }
+
+    private void ensureArCoreAndStart() {
+        try {
+            switch (ArCoreApk.getInstance().checkAvailability(this)) {
+                case SUPPORTED_INSTALLED:
+                    startAir();
+                    return;
+                case SUPPORTED_APK_TOO_OLD:
+                case SUPPORTED_NOT_INSTALLED:
+                    say("AIR MOUSE needs Google Play Services for AR (free, from the Play Store) - opening the install...");
+                    ArCoreApk.getInstance().requestInstall(this, true);
+                    return; // onResume after the install re-tries
+                case UNKNOWN_CHECKING:
+                    say("Checking ARCore support...");
+                    ui.postDelayed(() -> { if (mode != ControllerService.MODE_AIR) ensureArCoreAndStart(); }, 300);
+                    return;
+                default:
+                    say("AIR MOUSE: this phone does not support ARCore. POINT and TILT still work.");
+            }
+        } catch (UnavailableException e) {
+            say("AIR MOUSE unavailable: " + e.getMessage() + ". POINT and TILT still work.");
+        } catch (Exception e) {
+            say("AIR MOUSE could not start: " + e.getMessage());
+        }
+    }
+
+    private void startAir() {
+        applyMode(ControllerService.MODE_AIR);
+        if (air == null) air = new AirMouse(this, (txt, tracking) -> ui.post(() -> airStatus.setText(txt)));
+        if (airView == null) {
+            airView = new GLSurfaceView(this);
+            airView.setEGLContextClientVersion(2);
+            airView.setPreserveEGLContextOnPause(true);
+            airView.setRenderer(air);
+            airView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
+            /* 1dp: the view only supplies the GL context ARCore requires. No
+               camera preview is drawn; the status line says what is happening. */
+            root.addView(airView, 0, new LinearLayout.LayoutParams(dp(1), dp(1)));
+        }
+        airView.onResume();
+        air.start();
+    }
+
+    private void stopAir() {
+        if (airView != null) airView.onPause();
+        if (air != null) air.stop();
     }
 
     private void applyKeepOn(boolean on) {
@@ -422,10 +527,18 @@ public class MainActivity extends Activity {
         super.onResume();
         ControllerService.statusListener = refresh;
         refresh.run();
+        if (mode == ControllerService.MODE_AIR && airView == null
+                && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            ensureArCoreAndStart(); // returns from the ARCore install flow, or restarts after backgrounding
+        } else if (mode == ControllerService.MODE_AIR && air != null) {
+            airView.onResume();
+            air.start();
+        }
     }
 
     @Override protected void onPause() {
         super.onPause();
+        stopAir(); // camera fully off whenever the app is not on screen
         ControllerService.statusListener = null;
         // Never leave a trigger stuck if the app goes to background / screen off.
         if (fireOn) setAction(true, false);
