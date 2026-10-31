@@ -858,6 +858,14 @@ export function createRelayServer(options = {}) {
      chair for a ghost; a page that never heartbeats is from before this
      clock and is left exactly as alone as it always was. */
   const roomSilenceMs = positiveInteger(options.roomSilenceMs, 25_000);
+  /* How long a started duel holds the chair of the player who just lost it.
+     The page's own rejoin window (15s client-side) decides whether the match
+     lives, so the chair stays reserved for exactly the identity that left it
+     for a little longer than that; a stranger with the room code must not be
+     able to walk into somebody else's running 1v1 during that window. Once
+     the hold lapses the match it belonged to is over anyway, so the chair
+     opens to whoever asks. */
+  const duelSeatHoldMs = positiveInteger(options.duelSeatHoldMs, 20_000);
   const gyroHeartbeat = setInterval(() => {
     const nowMs = Date.now();
     for (const pair of gyroPairs.values()) {
@@ -1185,6 +1193,8 @@ export function createRelayServer(options = {}) {
        deploy card, and nobody is judged on time spent before they were here. */
     peer.activeAt = Date.now();
     room.members.set(peer.id, peer);
+    /* Any seat taken is no longer vacant, whoever took it. */
+    room.vacantSeat = null;
     if (role === 'host') room.host = peer;
     console.log(`Join: ${describePeer(peer)} as ${role} in room ${room.code}`);
     /* Here rather than at connect: this is the point a peer has cleared the
@@ -1288,6 +1298,9 @@ export function createRelayServer(options = {}) {
       battlePassLastCountedSnapshotBucket: -1,
       battlePassParticipants: new Set(),
       migrating: null,
+      /* Identity of the player whose departure emptied a chair in a running
+         duel; the join gate keeps that chair for them for duelSeatHoldMs. */
+      vacantSeat: null,
       snapshotAt: 0,
       snapshotIntervalMs: 0,
       snapshotStallTimer: null,
@@ -1372,15 +1385,21 @@ export function createRelayServer(options = {}) {
         }
       }
     }
-    /* A running 1v1 refuses arrivals only while both chairs are taken. A
-       chair standing empty — its player dropped and the close already
-       landed — is fillable: that is how the dropped player's own rejoin
-       gets back in, and a stranger filling it faces the same round the
-       chair's old owner left. */
-    if (room.rules === 'duel' && room.started && !reclaimed &&
-        room.members.size >= 2) {
-      sendError(peer, 'room-full', 'This 1v1 round is running. Wait for the next pair.');
-      return;
+    /* A running 1v1 refuses arrivals while both chairs are taken. A chair
+       standing empty — its player dropped and the close already landed —
+       is still theirs for duelSeatHoldMs: that is how the dropped player's
+       own rejoin gets back in, and nobody else may take it mid-round. The
+       same 'room-full' answer as a full room, so an older page reads it the
+       way it always has. Once the hold lapses the chair opens. */
+    if (room.rules === 'duel' && room.started && !reclaimed) {
+      const held = room.vacantSeat &&
+        Date.now() - room.vacantSeat.at <= duelSeatHoldMs;
+      const ownSeat = held && peer.resumeId &&
+        peer.resumeId === room.vacantSeat.resumeId;
+      if (room.members.size >= 2 || (held && !ownSeat)) {
+        sendError(peer, 'room-full', 'This 1v1 round is running. Wait for the next pair.');
+        return;
+      }
     }
     if (room.members.size >= (room.rules === 'duel' ? 2 : Protocol.MAX_PLAYERS)) {
       sendError(peer, 'room-full', 'That room is full.');
@@ -2358,6 +2377,9 @@ export function createRelayServer(options = {}) {
       if (departedHost.userId)
         room.migrating.departedUserIds.add(departedHost.userId);
       room.members.delete(departedHost.id);
+      if (room.rules === 'duel' && room.started && room.members.size === 1) {
+        room.vacantSeat = { resumeId: departedHost.resumeId, at: Date.now() };
+      }
       clearRoomMembership(departedHost);
       attemptPromotion(room);
       return;
@@ -2378,6 +2400,9 @@ export function createRelayServer(options = {}) {
     }
 
     room.members.delete(peer.id);
+    if (room.rules === 'duel' && room.started && room.members.size === 1) {
+      room.vacantSeat = { resumeId: peer.resumeId, at: Date.now() };
+    }
     clearRoomMembership(peer);
     if (room.migrating) room.migrating.expected.delete(peer.id);
     /* A room back down to one person has nobody to play against, so the clock

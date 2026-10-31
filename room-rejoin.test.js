@@ -133,17 +133,54 @@ test('resume reclaim: a rejoin takes its own seat back, no duplicate player', as
       'started duel still refuses new arrivals');
     stranger.close();
 
-    /* A clean drop (close seen, seat already freed) rejoins the running
-       duel through the same door: the empty chair is fillable. */
+    /* A clean drop (close seen, seat already freed) leaves the chair held
+       for the player who lost it: a stranger is refused, the original
+       resume walks back into the running round. */
     rejoin.close();
     assert(await until(() => has(host, m => m.t === 'members' &&
       m.members.length === 1)), 'the drop freed the chair');
-    const clean = await connect(port);
-    clean.send(hello({ t: 'join', room, resume: 'clean-resume-7' }));
-    assert(await until(() => has(clean, m => m.t === 'room' && m.started === true)),
-      'dropped player can re-enter the running duel on a free seat');
+    const stranger2 = await connect(port);
+    stranger2.send(hello({ t: 'join', room, resume: 'stranger-resume-10' }));
+    assert(await until(() => has(stranger2, m => m.t === 'error' && m.code === 'room-full')),
+      'third client cannot take the held chair mid-round');
+    stranger2.close();
+    const back = await connect(port);
+    back.send(hello({ t: 'join', room, resume: 'guest-resume-2' }));
+    assert(await until(() => has(back, m => m.t === 'room' && m.started === true)),
+      'original player re-enters the running duel on their held chair');
 
-    host.close(); clean.close();
+    host.close(); back.close();
+  } finally {
+    await relay.close();
+  }
+});
+
+test('duel seat hold lapses: an abandoned chair opens to a new player', async () => {
+  const relay = createRelayServer({ roomSilenceMs: 60_000, duelSeatHoldMs: 300 });
+  await new Promise(r => relay.listen(0, '127.0.0.1', r));
+  const port = relay.address().port;
+  try {
+    const host = await connect(port);
+    host.send(hello({ t: 'create', listed: false, rules: 'duel', resume: 'host-resume-5' }));
+    assert(await until(() => has(host, m => m.t === 'room')), 'host seated');
+    const room = host.msgs.find(m => m.t === 'room').room;
+
+    const guest = await connect(port);
+    guest.send(hello({ t: 'join', room, resume: 'guest-resume-5' }));
+    assert(await until(() => has(guest, m => m.t === 'room')), 'guest seated');
+    host.send(JSON.stringify({ t: 'start', v: V, authorityEpoch: 1, round: 0 }));
+    assert(await until(() => has(guest, m => m.t === 'start')), 'duel started');
+
+    guest.close();
+    assert(await until(() => has(host, m => m.t === 'members' &&
+      m.members.length === 1)), 'the drop freed the chair');
+    await wait(500);
+
+    const late = await connect(port);
+    late.send(hello({ t: 'join', room, resume: 'late-resume-1' }));
+    assert(await until(() => has(late, m => m.t === 'room' && m.started === true)),
+      'chair opens once the rejoin hold has lapsed');
+    late.close(); host.close();
   } finally {
     await relay.close();
   }
