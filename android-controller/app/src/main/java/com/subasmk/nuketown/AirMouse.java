@@ -42,6 +42,10 @@ public class AirMouse implements GLSurfaceView.Renderer {
     /* Per-frame sanity limits: bigger jumps are tracking glitches, not hands. */
     private static final float MAX_STEP_M = 0.15f;
     private static final float MAX_STEP_DEG = 8f;
+    /* Standing still must be still: pose noise and slow ARCore drift are
+       sub-mm per frame, so tiny accumulated movement never reaches the view.
+       Real hand movement crosses the deadzone in a frame or two. */
+    private static final float DEADZONE_M = 0.002f;
 
     private final Activity activity;
     private final Listener listener;
@@ -50,7 +54,8 @@ public class AirMouse implements GLSurfaceView.Renderer {
     private int textureId = -1;
     private int viewW = 1, viewH = 1;
     private boolean haveLast;
-    private float lastX, lastY;
+    private float lastX, lastY, lastZ;
+    private float accLat, accVert;
     private String lastText;
 
     public AirMouse(Activity activity, Listener listener) {
@@ -92,7 +97,7 @@ public class AirMouse implements GLSurfaceView.Renderer {
     }
 
     /** RE-CENTRE: the phone's current position becomes the aim reference. */
-    public void recenter() { haveLast = false; }
+    public void recenter() { haveLast = false; accLat = accVert = 0; }
 
     @Override public void onSurfaceCreated(GL10 gl, EGLConfig config) {
         int[] t = new int[1];
@@ -123,22 +128,42 @@ public class AirMouse implements GLSurfaceView.Renderer {
                 notify("AIR MOUSE: tracking lost - needs decent light and visible surfaces. Move slowly.", false);
                 return;
             }
-            float[] t = cam.getPose().getTranslation();
-            float x = t[0], y = t[1];           // metres: right, up
-            if (!haveLast) { lastX = x; lastY = y; haveLast = true;
+            com.google.ar.core.Pose pose = cam.getPose();
+            float[] t = pose.getTranslation();
+            float x = t[0], y = t[1], z = t[2];
+            /* Device-heading axes, not raw world axes: ARCore's world frame is
+               fixed at session start, so "right" in world stops matching the
+               player's hand once they turn their body. Project the camera's
+               right vector onto the ground plane and measure lateral movement
+               against THAT, so hand-right is look-right however they stand. */
+            float[] q = pose.getRotationQuaternion();
+            float rx = 1f - 2f * (q[1] * q[1] + q[2] * q[2]);
+            float rz = 2f * (q[0] * q[2] - q[1] * q[3]);
+            float rl = (float) Math.sqrt(rx * rx + rz * rz);
+            if (rl < 1e-4f) return; // phone pointing straight up/down: no heading
+            rx /= rl; rz /= rl;
+            if (!haveLast) { lastX = x; lastY = y; lastZ = z; haveLast = true;
+                accLat = accVert = 0;
                 notify("AIR MOUSE: tracking - move the phone to aim. RE-CENTRE resets.", true);
                 return; }
-            float dx = x - lastX, dy = y - lastY;
-            lastX = x; lastY = y;
-            if (Math.abs(dx) > MAX_STEP_M || Math.abs(dy) > MAX_STEP_M) return; // glitch frame
+            float dx = x - lastX, dy = y - lastY, dz = z - lastZ;
+            lastX = x; lastY = y; lastZ = z;
+            if (Math.abs(dx) > MAX_STEP_M || Math.abs(dy) > MAX_STEP_M || Math.abs(dz) > MAX_STEP_M) return; // glitch frame
+            /* Rotation about the wrist also moves the camera through space;
+               that part is inseparable from a deliberate slide without knowing
+               the player's arm, so it is drift the deadzone + RE-CENTRE absorb. */
+            accLat += dx * rx + dz * rz;   // metres, device-right positive
+            accVert += dy;                 // metres, up positive
+            if (Math.abs(accLat) < DEADZONE_M && Math.abs(accVert) < DEADZONE_M) return;
             float sens = 13f;
             ControllerService c = ControllerService.inst;
             if (c != null) sens = c.sensNow();
             float k = DEG_PER_M * (sens / 13f);
             /* Same sign convention as TILT: hand right = look right, hand up =
-               look up. Clamped per frame so a bad frame never whips the view. */
-            float lookX = clamp(dx * k, MAX_STEP_DEG);
-            float lookY = clamp(-dy * k, MAX_STEP_DEG);
+               look up. Clamped per batch so a bad frame never whips the view. */
+            float lookX = clamp(accLat * k, MAX_STEP_DEG);
+            float lookY = clamp(-accVert * k, MAX_STEP_DEG);
+            accLat = accVert = 0;
             if (lookX != 0 || lookY != 0) {
                 ControllerService svc = ControllerService.inst;
                 if (svc != null) svc.addLook(lookX, lookY);
