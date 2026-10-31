@@ -1,8 +1,14 @@
 /* User-authored gesture layer. Does not send OS input or alter network rules. */
-const GESTURE = {enabled:false,fwd:0,strafe:0,ax:0,ay:0,fire:false,mouse:false,last:0};
+const GESTURE = {enabled:false,fwd:0,strafe:0,ax:0,ay:0,fire:false,mouse:false,last:0,ownsFire:false};
 function gesturePhoneLive(){return (typeof PHONE_LIVE==='function'&&PHONE_LIVE())||(typeof CTL_LIVE==='function'&&CTL_LIVE());}
 function gestureMoveOnly(){return typeof GestureControl!=='undefined'&&GestureControl.isMoveOnly?.();}
-function gestureStop(){GESTURE.fwd=GESTURE.strafe=GESTURE.ax=GESTURE.ay=0;GESTURE.fire=false;if(!GESTURE.mouse&&!gesturePhoneLive())releaseFire();}
+/* Fire is released only when this layer pressed it. Touch FIRE and the
+   mouse hold IN.firing for reasons the gesture layer never set; the old
+   unconditional release here ran every frame (gestureTick) and every
+   100ms (the watchdog), stripping touch fire the frame it was pressed
+   and making FIRE on a phone do nothing at all. Phone fire is not
+   gesture-owned either, so it is never touched. */
+function gestureStop(){GESTURE.fwd=GESTURE.strafe=GESTURE.ax=GESTURE.ay=0;GESTURE.fire=false;if(GESTURE.ownsFire){GESTURE.ownsFire=false;if(!GESTURE.mouse)releaseFire();}}
 function gestureAccepts(){return GESTURE.enabled && document.hasFocus()&&!document.hidden&&G.started&&!G.paused&&!G.over&&G.player&&G.player.alive;}
 function gestureTick(dt){
   const panel=document.getElementById?.('gesture-panel');if(panel){const ctl=document.getElementById?.('ctl-panel');const top=Math.max(85,(ctl?.getBoundingClientRect?.().bottom||0)+8);panel.style.top=G.started?top+'px':'auto';panel.style.bottom=G.started?'auto':'8px';}
@@ -13,8 +19,10 @@ function gestureTick(dt){
   const phoneAim=gesturePhoneLive();
   if(!phoneAim&&!gestureMoveOnly()){
     applyLook(GESTURE.ax*600*Math.min(dt,.05),GESTURE.ay*460*Math.min(dt,.05),mouseSens);
-    if(GESTURE.fire&&!IN.firing)pressFire();
-    if(!GESTURE.fire&&!GESTURE.mouse&&IN.firing)releaseFire();
+    /* Same ownership as gestureStop: pinch presses, un-pinch releases, and
+       nothing else's hold on IN.firing is ever cleared here. */
+    if(GESTURE.fire){if(!GESTURE.ownsFire){GESTURE.ownsFire=true;pressFire();}}
+    else if(GESTURE.ownsFire){GESTURE.ownsFire=false;if(!GESTURE.mouse)releaseFire();}
   }
 }
 addEventListener('DOMContentLoaded',()=>{

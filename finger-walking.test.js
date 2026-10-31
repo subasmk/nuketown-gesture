@@ -62,3 +62,33 @@ test('actual PHONE_LIVE and CTL_LIVE implementations both select MOVE ONLY',()=>
  h.timers.forEach(f=>f());assert.equal(h.c.GestureControl.isMoveOnly(),true);for(let i=0;i<8;i++)h.frame(4);assert(h.c.g.strafe<-.9);
  h.advance(1100);h.timers.forEach(f=>f());assert.equal(h.c.GestureControl.isMoveOnly(),false);
 });
+
+test('touch FIRE survives the gesture watchdog; the gesture layer releases only its own shots',()=>{
+ const h=harness(true);
+ /* A phone that never started the camera: gestures disabled, so gestureTick
+    takes the stop branch every frame - the path that used to strip touch
+    fire on the very next frame. */
+ h.c.g.enabled=false;
+ h.c.IN.firing=true;                    // what touchFirePress does
+ h.c.gestureTick(.016);h.c.gestureTick(.016);
+ assert.equal(h.c.IN.firing,true,'touch hold survives gestureTick');
+ h.timers.forEach(f=>f());              // the 100ms watchdog
+ assert.equal(h.c.IN.firing,true,'touch hold survives the watchdog');
+ h.c.gestureStop();
+ assert.equal(h.c.IN.firing,true,'touch hold survives a stop');
+
+ /* With the camera live, a pinch presses and releases its own shot. */
+ h.c.g.enabled=true;
+ h.frame(1);                            // fresh tracking, so tick takes the live branch
+ h.c.g.fire=true;h.c.gestureTick(.016);
+ assert.equal(h.c.IN.firing,true,'pinch fires');
+ assert.equal(h.c.g.ownsFire,true);
+ h.c.IN.firing=false;                   // touch released its own hold meanwhile
+ h.c.g.fire=false;h.c.gestureTick(.016);
+ assert.equal(h.c.IN.firing,false,'un-pinch releases the gesture shot');
+ assert.equal(h.c.g.ownsFire,false);
+
+ /* Mouse-held fire is never gesture-owned, so a stop leaves it alone. */
+ h.c.g.mouse=true;h.c.IN.firing=true;h.c.gestureStop();
+ assert.equal(h.c.IN.firing,true,'mouse hold survives a stop');
+});
