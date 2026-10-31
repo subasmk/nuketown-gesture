@@ -6,8 +6,8 @@ android {
         applicationId 'com.subasmk.nuketown.controller'
         minSdk 24
         targetSdk 34
-        versionCode 8
-        versionName '4.4'
+        versionCode 9
+        versionName '4.4.1'
     }
     /* The debug key is no longer committed: the old one leaked with the public
        repo, so v4.0 signs with a fresh local key (installs need one uninstall of

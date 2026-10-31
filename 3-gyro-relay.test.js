@@ -172,6 +172,6 @@ test('android app wiring: no gun picker on the phone, sensitivity on both screen
   assert.match(act, /AIM SENSITIVITY/);
   assert.match(svc, /setSens/);
   assert.match(svc, /sens \/ 13f/);
-  assert.match(gradle, /versionCode 8/);
-  assert.match(gradle, /versionName '4\.4'/);
+  assert.match(gradle, /versionCode 9/);
+  assert.match(gradle, /versionName '4.4.1'/);
 });
