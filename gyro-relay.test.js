@@ -322,7 +322,7 @@ test('gyro heartbeat: a phone sending only keepalives stays connected and its hb
   const gameHb = setInterval(() => { try { game.send('{"t":"hb"}'); } catch {} }, 100);
   const phone = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=phone&code=HBPH`);
   let lastState = null;
-  phone.on('message', m => { lastState = JSON.parse(m.toString()); });
+  phone.on('message', m => { const o = JSON.parse(m.toString()); if (o.t === 'paired') lastState = o; });
   await new Promise((resolve) => phone.once('open', resolve));
   const phoneHb = setInterval(() => { try { phone.send('{"t":"hb"}'); } catch {} }, 100);
   try {
@@ -332,4 +332,26 @@ test('gyro heartbeat: a phone sending only keepalives stays connected and its hb
     assert.deepEqual(lastState, { t: 'paired', on: true });
     assert.deepEqual(gameGot.filter(m => m.t === 'hb'), [], 'hb frames must be consumed, not forwarded');
   } finally { clearInterval(gameHb); clearInterval(phoneHb); game.close(); phone.close(); await relay.close(); }
+});
+
+test('gyro heartbeat: hb sender gets an hbok ack; the peer does not', async () => {
+  const { createRelayServer } = await import('./server.mjs');
+  const relay = createRelayServer({ gyroHeartbeatMs: 150, gyroSilenceMs: 500 });
+  await new Promise((resolve, reject) => { relay.server.once('error', reject); relay.listen(0, '127.0.0.1', resolve); });
+  const port = relay.address().port;
+  const game = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=game&code=ACK1`);
+  const gameGot = [];
+  game.on('message', m => gameGot.push(m.toString()));
+  await new Promise((resolve) => game.once('open', resolve));
+  const phone = new WebSocket(`ws://127.0.0.1:${port}/gyro?role=phone&code=ACK1`);
+  const phoneGot = [];
+  phone.on('message', m => phoneGot.push(m.toString()));
+  await new Promise((resolve) => phone.once('open', resolve));
+  game.send('{"t":"hb"}');
+  phone.send('{"t":"hb"}');
+  await new Promise(r => setTimeout(r, 400));
+  assert.ok(gameGot.includes('{"t":"hbok"}'), 'game should get hbok');
+  assert.ok(phoneGot.includes('{"t":"hbok"}'), 'phone should get hbok');
+  assert.ok(!phoneGot.some(m => m.includes('hb"}')), 'phone must not receive the game hb itself');
+  game.close(); phone.close(); await relay.close();
 });

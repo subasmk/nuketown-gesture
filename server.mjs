@@ -887,8 +887,11 @@ export function createRelayServer(options = {}) {
       ` (game=${!!pair.game} phone=${!!pair.phone})`);
     gyroTellPhone(pair);
     ws.on('message', (data) => {
-      /* Keepalive frames from either side are liveness proof, not input. */
-      try { const m = JSON.parse(data.toString()); if (m && m.t === 'hb') { if (isGame) pair.gameMsgAt = Date.now(); else pair.phoneMsgAt = Date.now(); return; } } catch {}
+      /* Keepalive frames from either side are liveness proof, not input. The
+         sender gets {"t":"hbok"} back: an edge proxy can keep a culled
+         client's socket looking open, so the ack is the only way the game
+         page can tell the server still considers it paired. */
+      try { const m = JSON.parse(data.toString()); if (m && m.t === 'hb') { if (isGame) pair.gameMsgAt = Date.now(); else pair.phoneMsgAt = Date.now(); try { ws.send('{"t":"hbok"}'); } catch {} return; } } catch {}
       if (isGame) pair.gameMsgAt = Date.now(); else pair.phoneMsgAt = Date.now();
       const target = isGame ? pair.phone : pair.game;
       if (target && target.readyState === WebSocket.OPEN) target.send(data.toString());

@@ -2,7 +2,7 @@
    (or the legacy browser page at /gyro-controller) connects and streams orientation deltas over
    a WebSocket on /gyro. While a phone is live it owns aim + fire and the
    webcam hand drives walking only; nothing leaves the hotspot. */
-const PHONE = { enabled: false, ws: null, liveUntil: 0, last: 0, lookX: 0, lookY: 0, aim: null, applied: null, fire: false, jump: false, holding: false };
+const PHONE = { enabled: false, ws: null, liveUntil: 0, last: 0, lookX: 0, lookY: 0, aim: null, applied: null, fire: false, jump: false, holding: false, lastHbOk: 0, everHbOk: false, retry: 0, retryTimer: 0 };
 function PHONE_JUMP() { return PHONE_LIVE() && PHONE.jump; }
 /* The gesture bridge asks this before applying webcam aim/fire. */
 function PHONE_LIVE() { return PHONE.enabled && PHONE.ws && PHONE.ws.readyState === 1 && performance.now() < PHONE.liveUntil; }
@@ -44,24 +44,57 @@ function phoneTick(dt) {
   if (PHONE.fire && !IN.firing) { pressFire(); PHONE.holding = true; }
   if (!PHONE.fire && PHONE.holding && IN.firing) { PHONE.holding = false; releaseFire(); }
 }
-function phoneConnect() {
-  if (PHONE.ws && PHONE.ws.readyState <= 1) { PHONE.enabled = false; try { PHONE.ws.close(); } catch {} PHONE.ws = null; phoneRelease(); phoneStatus('Off. Tap CONNECT PHONE to start again.'); try { localStorage.setItem('pn-phone-enabled', '0'); } catch (e) {} return; }
-  PHONE.enabled = true;
-  try { localStorage.setItem('pn-phone-enabled', '1'); } catch (e) {}
+/* Self-heal delays after an unexpected drop: quick first retry, then back
+     off, then stop and ask instead of looping forever. */
+const PHONE_RETRY_DELAYS = [0, 3000, 8000, 15000, 30000];
+function phoneScheduleRetry() {
+  if (!PHONE.enabled || PHONE.retry >= PHONE_RETRY_DELAYS.length) {
+    if (PHONE.enabled) phoneStatus('Still cannot reach the game. Tap CONNECT PHONE to try again.');
+    return;
+  }
+  const delay = PHONE_RETRY_DELAYS[PHONE.retry];
+  PHONE.retry++;
+  if (PHONE.retryTimer) clearTimeout(PHONE.retryTimer);
+  PHONE.retryTimer = setTimeout(() => {
+    PHONE.retryTimer = 0;
+    if (!PHONE.enabled || (PHONE.ws && PHONE.ws.readyState <= 1)) return;
+    phoneOpenSocket(true);
+  }, delay);
+}
+function phoneOpenSocket(auto) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(proto + '://' + location.host + '/gyro?role=game&code=' + PHONE.code);
   PHONE.ws = ws;
-  phoneStatus('Waiting for phone... in the phone app, type this address and code ' + PHONE.code + '.');
-  ws.onopen = () => phoneStatus('Ready. Phone app: address ' + location.host + ', code ' + PHONE.code + ', then CONNECT.');
+  if (!auto) phoneStatus('Waiting for phone... in the phone app, type this address and code ' + PHONE.code + '.');
+  ws.onopen = () => { PHONE.lastHbOk = performance.now(); if (!auto) phoneStatus('Ready. Phone app: address ' + location.host + ', code ' + PHONE.code + ', then CONNECT.'); };
   /* Application-level liveness: some proxies answer WebSocket pings at the
      edge, so the server cannot trust pong frames to mean this page is alive.
      A tiny app message every 5s is unforgeable proof; the server drops a
-     game that goes silent for >15s and tells the phone. */
+     game that goes silent for >20s and tells the phone. The server answers
+     each heartbeat with {"t":"hbok"}; a proxy can keep a culled socket
+     looking open, so missing acks - not the socket state - are what tell
+     this page the server dropped it. */
   if (PHONE.hb) clearInterval(PHONE.hb);
-  PHONE.hb = setInterval(() => { try { if (ws.readyState === 1) ws.send('{"t":"hb"}'); } catch (e) {} }, 5000);
+  PHONE.hb = setInterval(() => {
+    try {
+      if (ws.readyState !== 1) return;
+      ws.send('{"t":"hb"}');
+      /* Hidden tabs get their timers throttled by the browser, so only
+         judge staleness while visible; on return, visibilitychange below
+         reconnects if the server culled us meanwhile. */
+      if (!document.hidden && PHONE.everHbOk && PHONE.ws === ws
+          && performance.now() - PHONE.lastHbOk > 12000) {
+        try { ws.close(); } catch (e) {}
+      }
+    } catch (e) {}
+  }, 5000);
   ws.onmessage = e => {
     try {
       const m = JSON.parse(e.data);
+      /* Heartbeat ack: liveness bookkeeping only. It must NOT mark the phone
+         live (that is real aim/look/fire input), or the webcam hand would be
+         stuck in walking mode with no phone connected. */
+      if (m.t === 'hbok') { PHONE.lastHbOk = performance.now(); PHONE.everHbOk = true; PHONE.retry = 0; return; }
       PHONE.last = performance.now(); PHONE.liveUntil = PHONE.last + 1500;
       if (m.t === 'look') {
         PHONE.lookX = Math.max(-500, Math.min(500, PHONE.lookX + (+m.dx || 0)));
@@ -87,8 +120,25 @@ function phoneConnect() {
       phoneStatus(PHONE.fire ? 'Phone live — FIRING' : 'Phone live — point aims, Vol UP shoots, Vol DOWN jumps. Webcam hand = walking.');
     } catch {}
   };
-  ws.onclose = () => { if (PHONE.hb) { clearInterval(PHONE.hb); PHONE.hb = null; } if (PHONE.ws === ws) { PHONE.ws = null; phoneRelease(); phoneStatus('Phone disconnected. Tap CONNECT PHONE to retry.'); } };
+  ws.onclose = () => {
+    if (PHONE.hb) { clearInterval(PHONE.hb); PHONE.hb = null; }
+    if (PHONE.ws !== ws) return;
+    PHONE.ws = null;
+    phoneRelease();
+    /* Intentional toggle-off clears PHONE.enabled before closing, so it
+       never lands here; only unexpected drops (cull, deploy, network) get
+       the auto-retry, and only a few times before asking. */
+    if (PHONE.enabled) { phoneStatus('Connection lost. Reconnecting...'); phoneScheduleRetry(); }
+    else phoneStatus('Phone disconnected. Tap CONNECT PHONE to retry.');
+  };
   ws.onerror = () => {};
+}
+function phoneConnect() {
+  if (PHONE.ws && PHONE.ws.readyState <= 1) { PHONE.enabled = false; if (PHONE.retryTimer) { clearTimeout(PHONE.retryTimer); PHONE.retryTimer = 0; } try { PHONE.ws.close(); } catch {} PHONE.ws = null; phoneRelease(); phoneStatus('Off. Tap CONNECT PHONE to start again.'); try { localStorage.setItem('pn-phone-enabled', '0'); } catch (e) {} return; }
+  PHONE.enabled = true;
+  PHONE.retry = 0;
+  try { localStorage.setItem('pn-phone-enabled', '1'); } catch (e) {}
+  phoneOpenSocket(false);
 }
 addEventListener('DOMContentLoaded', () => {
   /* Per-laptop pairing code: the phone app must type this code so two
@@ -108,11 +158,46 @@ addEventListener('DOMContentLoaded', () => {
   const link = document.getElementById('phone-link');
   try { link.textContent = location.origin + '/gyro-controller (browser fallback) or the Android app'; } catch {}
   document.getElementById('phone-connect').onclick = phoneConnect;
+  /* Mid-match the only reachable surface is the pause card, so while the
+     game is paused (#title.hud) the panel moves inside that card, always
+     visible - no gear tap needed. Unpausing puts it back in its corner,
+     where the settings popover shows it as before. */
+  const phoneSyncMount = () => {
+    const title = document.getElementById('title');
+    const menu = document.getElementById('menu');
+    const paused = !!(title && title.classList.contains('hud') && menu);
+    if (paused) {
+      if (box.parentNode !== menu) menu.appendChild(box);
+      box.style.position = 'static'; box.style.width = '100%';
+      box.style.marginTop = '8px'; box.style.display = 'block';
+    } else {
+      if (box.parentNode !== document.body) document.body.appendChild(box);
+      box.style.position = 'fixed'; box.style.width = '230px';
+      box.style.marginTop = ''; box.style.display = '';
+    }
+  };
+  const titleEl = document.getElementById('title');
+  if (titleEl && typeof MutationObserver === 'function') {
+    try { new MutationObserver(phoneSyncMount).observe(titleEl, { attributes: true, attributeFilter: ['class'] }); } catch (e) {}
+  }
+  phoneSyncMount();
   /* A page reload (deploy, refresh, crash) used to silently drop the laptop
      half of the pair: the phone app reconnects on its own and its messages
      then went nowhere, leaving aim + fire dead with the phone still showing
      "Connected". Re-listen automatically if the phone was on before. */
   try { if (localStorage.getItem('pn-phone-enabled') === '1') phoneConnect(); } catch (e) {}
   addEventListener('blur', () => { PHONE.lookX = PHONE.lookY = 0; phoneRelease(); });
-  document.addEventListener('visibilitychange', () => { if (document.hidden) { PHONE.lookX = PHONE.lookY = 0; phoneRelease(); } });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { PHONE.lookX = PHONE.lookY = 0; phoneRelease(); return; }
+    /* Back on screen: if the server culled this tab while it was hidden
+       (throttled timers stop the heartbeat), rebuild the pair on the same
+       code so the phone reconnects by itself. */
+    if (PHONE.enabled && !document.hidden
+        && (!PHONE.ws || (PHONE.ws.readyState > 1)
+            || (PHONE.everHbOk && performance.now() - PHONE.lastHbOk > 12000))) {
+      if (PHONE.ws) { try { PHONE.ws.close(); } catch (e) {} PHONE.ws = null; }
+      PHONE.retry = 0;
+      phoneOpenSocket(true);
+    }
+  });
 });

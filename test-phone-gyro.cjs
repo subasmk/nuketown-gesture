@@ -9,7 +9,9 @@ const ctx = {
   performance: { now: () => now },
   document: { hasFocus: () => true, hidden: false },
   location: { protocol: 'https:', host: 'game.local', origin: 'https://game.local' },
-  WebSocket: class { constructor() { this.readyState = 1; ctx.lastSocket = this; } close() {} },
+  WebSocket: class { constructor(url) { this.url = url; this.readyState = 1; ctx.lastSocket = this; } close() { this.readyState = 3; if (this.onclose) this.onclose(); } },
+  setTimeout: (f, ms) => { ctx.timers.push(f); return ctx.timers.length; }, clearTimeout: () => {},
+  timers: [],
   G: { started: true, paused: false, over: false, player: { alive: true } },
   IN: { firing: false }, mouseSens: .0021, KEY: {},
   addEventListener: (k, f) => callbacks[k] = f,
@@ -21,8 +23,8 @@ const ctx = {
 };
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(require('path').join(__dirname, 'phone-gyro.js'), 'utf8') +
-  '\nglobalThis.testPhone = { PHONE, phoneTick, PHONE_LIVE };', ctx);
-const { PHONE, phoneTick, PHONE_LIVE } = ctx.testPhone;
+  '\nglobalThis.testPhone = { PHONE, phoneTick, PHONE_LIVE, phoneConnect };', ctx);
+const { PHONE, phoneTick, PHONE_LIVE, phoneConnect } = ctx.testPhone;
 
 // 1. Disabled/disconnected phone does nothing and reports not-live.
 phoneTick(.016);
@@ -243,3 +245,39 @@ console.log('PASS pause gates phone input');
   assert(Math.abs(movedDeg + 79.5) < 1.0, `variable-rate turn should land ~79.5 deg, got ${movedDeg}`);
   console.log('PASS variable message rate converges:', movedDeg.toFixed(2), 'deg');
 }
+
+// 12. hbok ack: updates liveness bookkeeping only - never marks the phone live.
+PHONE.code = 'TEST';
+PHONE.ws = null;                        // leftover stub from test 2 would toggle off
+PHONE.enabled = true; PHONE.retry = 3;
+phoneConnect();
+const sock1 = ctx.lastSocket;
+assert.strictEqual(PHONE.ws, sock1);
+assert(sock1.url.includes('code=TEST'), 'socket carries the pairing code');
+PHONE.last = 0; PHONE.liveUntil = 0; PHONE.aim = null;
+sock1.onmessage({ data: '{"t":"hbok"}' });
+assert.strictEqual(PHONE.aim, null, 'hbok must not create aim input');
+assert.strictEqual(PHONE.liveUntil, 0, 'hbok must not extend phone liveness');
+assert.strictEqual(PHONE_LIVE(), false, 'hbok alone is not a live phone');
+assert.strictEqual(PHONE.retry, 0, 'hbok resets the retry counter');
+assert.strictEqual(PHONE.everHbOk, true);
+console.log('PASS hbok is liveness bookkeeping only, not phone input');
+
+// 13. Unexpected close: auto-retry rebuilds the socket on the same code.
+const timersBefore = ctx.timers.length;
+sock1.onclose();
+assert.strictEqual(PHONE.ws, null);
+assert.strictEqual(ctx.timers.length, timersBefore + 1, 'one retry scheduled');
+ctx.timers[ctx.timers.length - 1]();
+const sock2 = ctx.lastSocket;
+assert.notStrictEqual(sock2, sock1, 'a new socket was opened');
+assert.strictEqual(PHONE.ws, sock2);
+assert(sock2.url.includes('code=TEST'), 'reconnect keeps the same code');
+console.log('PASS unexpected drop auto-reconnects on the same code');
+
+// 14. Intentional toggle-off: no auto-retry.
+phoneConnect();                 // toggles off: enabled=false, close() fires onclose
+assert.strictEqual(PHONE.enabled, false);
+const timersAfterOff = ctx.timers.length;
+assert.strictEqual(timersAfterOff, timersBefore + 1, 'intentional off schedules no retry');
+console.log('PASS intentional disconnect never auto-reconnects');
