@@ -166,8 +166,22 @@ const NET = {
   autoStartAt: 0,               // performance.now() the relay's clock reaches 0
   countdownTimer: 0,
   reports: new Set(),           // peer ids the relay has acknowledged a report for
-  reportSending: ''             // peer id of the report in flight, or ''
+  reportSending: '',            // peer id of the report in flight, or ''
+  /* Rejoin state: what a dropped socket needs to take its own seat back.
+     session is set at the room handshake and cleared only by endings the
+     player chose or the relay explained; resume names this tab to the relay
+     so the rejoin reclaims the ghost's seat instead of adding a player. */
+  session: null,
+  resume: '',
+  hbTimer: 0,
+  lastRxAt: 0,
+  rxTimer: 0,
+  reconnectAttempts: 0,
+  reconnectTimer: 0,
+  rejoining: false,
+  duelGraceTimer: 0
 };
+NET.resume = netResumeId();
 
 function netNow() { return performance.now(); }
 function netIsHost() { return NET.mode === 'host'; }
@@ -935,6 +949,11 @@ function netRenderLobbyMap() {
 function netResetTransport() {
   if (NET.connectTimer) clearTimeout(NET.connectTimer);
   NET.connectTimer = 0;
+  netStopLiveness();
+  if (NET.reconnectTimer) clearTimeout(NET.reconnectTimer);
+  NET.reconnectTimer = 0;
+  if (NET.duelGraceTimer) clearTimeout(NET.duelGraceTimer);
+  NET.duelGraceTimer = 0;
   if (NET.socket) {
     NET.manualClose = true;
     try { NET.socket.close(1000, 'leaving'); } catch (e) {}
@@ -992,6 +1011,85 @@ function netResetTransport() {
   netCancelStartTimeout();
   netCancelAutoStart();
   NET.manualClose = false;
+}
+
+/* Per-tab, per-browser random id, kept in sessionStorage so a page refresh
+   reclaims the seat the refresh dropped. It is not a login: it only ever
+   matches this tab's own previous socket inside the same room code. */
+function netResumeId() {
+  try {
+    const stored = sessionStorage.getItem('netResumeId');
+    if (stored && /^[A-Za-z0-9_-]{8,80}$/.test(stored)) return stored;
+    const buf = new Uint8Array(18);
+    crypto.getRandomValues(buf);
+    const id = Array.from(buf, b => b.toString(16).padStart(2, '0')).join('');
+    sessionStorage.setItem('netResumeId', id);
+    return id;
+  } catch (e) {
+    return 'r' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+}
+
+/* Reconnect backoff after an unexplained drop: quick enough that a blip
+   costs a beat, spaced enough that a dead server is not hammered, and finite
+   so a room that is really gone ends with an honest message. */
+const NET_RECONNECT_BACKOFF_MS = [0, 3000, 8000, 15000, 30000];
+/* How long a running 1v1 waits for a dropped opponent's rejoin before the
+   match is called. Sized to the first three backoff steps: long enough that
+   an ordinary blip never ends a round, short enough that a real walkout is
+   not a long stare at an empty chair. */
+const NET_DUEL_REJOIN_GRACE_MS = 15000;
+
+function netStartLiveness(ws) {
+  netStopLiveness();
+  NET.lastRxAt = Date.now();
+  /* The proxy keeps a culled socket looking open and answers its pings, so
+     socket state and pongs both lie. The only honest signal is application
+     traffic: hb every 5s, and anything at all coming back resets the clock. */
+  NET.hbTimer = setInterval(() => {
+    if (NET.socket === ws && ws.readyState === WebSocket.OPEN) netSend({ t: 'hb' });
+  }, 5000);
+  NET.rxTimer = setInterval(() => {
+    if (NET.socket !== ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!NET.session || (NET.phase !== 'playing' && NET.phase !== 'lobby')) return;
+    if (Date.now() - NET.lastRxAt > 12000) {
+      try { ws.close(4000, 'rx stalled'); } catch (e) {}
+    }
+  }, 4000);
+}
+
+function netStopLiveness() {
+  if (NET.hbTimer) clearInterval(NET.hbTimer);
+  NET.hbTimer = 0;
+  if (NET.rxTimer) clearInterval(NET.rxTimer);
+  NET.rxTimer = 0;
+}
+
+function netScheduleRejoin() {
+  if (NET.reconnectTimer) clearTimeout(NET.reconnectTimer);
+  NET.reconnectTimer = 0;
+  if (!NET.session ||
+      NET.reconnectAttempts >= NET_RECONNECT_BACKOFF_MS.length) {
+    netEndSession('Connection lost — return to the menu to reconnect.');
+    return;
+  }
+  const delay = NET_RECONNECT_BACKOFF_MS[NET.reconnectAttempts++];
+  /* Mid-match the match screen stays up — the world is frozen, not ended —
+     so the status line carries the whole story until the seat is back. */
+  netStatus('Connection dropped - reconnecting…', 'error');
+  NET.reconnectTimer = setTimeout(() => {
+    NET.reconnectTimer = 0;
+    netAttemptRejoin();
+  }, delay);
+}
+
+function netAttemptRejoin() {
+  const session = NET.session;
+  if (!session) return;
+  NET.rejoining = true;
+  /* Name, maps and cosmetics are read fresh from the page inside netConnect;
+     the session only pins down which room and which rules to ask for. */
+  netConnect('join', session.room, null, session.rules);
 }
 
 function netConnect(kind, requestedRoom, quickPlan, rules) {
@@ -1052,6 +1150,7 @@ function netConnect(kind, requestedRoom, quickPlan, rules) {
   NET.socket = ws;
   ws.addEventListener('open', () => {
     if (NET.socket !== ws || !NET.wanted) return;
+    netStartLiveness(ws);
     const w = NET.wanted;
     const hello = {
       t: w.kind, v: NETP.VERSION, room: w.room, name: w.name,
@@ -1059,6 +1158,7 @@ function netConnect(kind, requestedRoom, quickPlan, rules) {
     };
     const authToken = netAuthTokenForSocket(socketURL);
     if (authToken) hello.authToken = authToken;
+    hello.resume = NET.resume;
     netSend(hello);
   });
   ws.addEventListener('message', e => netHandleWire(e.data));
@@ -1071,9 +1171,26 @@ function netConnect(kind, requestedRoom, quickPlan, rules) {
   ws.addEventListener('close', () => {
     if (NET.socket !== ws) return;
     const wasPlaying = NET.phase === 'playing';
+    const wasInRoom = wasPlaying || NET.phase === 'lobby';
     const manual = NET.manualClose;
     NET.socket = null;
+    netStopLiveness();
     if (!manual) {
+      /* A rejoin attempt that lost its own socket is just the next attempt. */
+      if (NET.rejoining && NET.phase === 'connecting') {
+        netSetMenuBusy(false);
+        netScheduleRejoin();
+        return;
+      }
+      /* An unexplained drop out of a live room is a transport failure, not
+         the end of the match: the relay seats rejoiners on the same code, so
+         take the seat back. Closes the relay explained (idle, kicked,
+         banned) keep their old ending and are not retried. */
+      if (!NET.endReason && NET.session && wasInRoom) {
+        netSetMenuBusy(false);
+        netScheduleRejoin();
+        return;
+      }
       if (wasPlaying) {
         /* The relay explains itself before it hangs up — being told you sat
            out the match is a different thing from losing your connection, and
@@ -1097,8 +1214,10 @@ function netConnect(kind, requestedRoom, quickPlan, rules) {
 }
 
 function netHandleWire(raw) {
+  NET.lastRxAt = Date.now();
   let msg;
   try { msg = JSON.parse(raw); } catch (e) { return; }
+  if (msg && msg.t === 'hbok') return;
   if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
 
   if (msg.t === 'room') {
@@ -1152,6 +1271,15 @@ function netHandleWire(raw) {
        already played a round leaves NET.round behind otherwise, and every
        subsequent `start` looks like it skipped ahead and gets ignored. */
     NET.round = Number.isSafeInteger(msg.round) && msg.round >= 0 ? msg.round : 0;
+    /* Everything a dropped socket needs to take its seat back. The name,
+       maps and cosmetics are read fresh from the page on every connect, so
+       the only things pinned here are the room code and its rules. */
+    NET.session = { room, rules: NET.duel ? 'duel' : 'standard' };
+    NET.reconnectAttempts = 0;
+    if (NET.rejoining) {
+      NET.rejoining = false;
+      netStatus('Reconnected.');
+    }
     /* Whether this room was chosen or fallen back to changes what the host
        needs to hear, and the plan is finished either way. */
     const opened = !!NET.quick && !!NET.quick.creating;
@@ -1223,8 +1351,25 @@ function netHandleWire(raw) {
     if (!netIsMultiplayer() || !members || !members.some(member => member.id === NET.id)) return;
     NET.members = members;
     if (NET.duel && NET.phase === 'playing' && !G.over && members.length !== 2) {
-      netLeaveMatch('1v1 cancelled: opponent left. No winner awarded. Create a new room for the next pair.');
+      /* A blip is not a forfeit. The opponent's page rejoins on its own now,
+         so the cancellation this used to be waits out the rejoin window;
+         the old ending still stands at the end of it. */
+      if (!NET.duelGraceTimer) {
+        netStatus('Opponent disconnected - waiting for them to rejoin…', 'error');
+        NET.duelGraceTimer = setTimeout(() => {
+          NET.duelGraceTimer = 0;
+          if (NET.duel && NET.phase === 'playing' && !G.over &&
+              NET.members.length !== 2) {
+            netLeaveMatch('1v1 cancelled: opponent left. No winner awarded. Create a new room for the next pair.');
+          }
+        }, NET_DUEL_REJOIN_GRACE_MS);
+      }
       return;
+    }
+    if (NET.duel && NET.duelGraceTimer && members.length === 2) {
+      clearTimeout(NET.duelGraceTimer);
+      NET.duelGraceTimer = 0;
+      netStatus('Opponent reconnected.');
     }
     if (NET.duel && NET.phase === 'lobby') netStatus(members.length === 2 ? '1v1 FIRST KILL WINS - Both players ready. Host: START MATCH.' : '1v1 FIRST KILL WINS - Waiting for opponent.');
     /* An unknown id here is not worth ending a session over: it is a forecast
@@ -1353,6 +1498,19 @@ function netHandleWire(raw) {
        reason, and by the time the socket shuts the message is gone. */
     if (msg.code === 'idle' || msg.code === 'kicked' || msg.code === 'banned')
       NET.endReason = errorText;
+    /* A rejoin attempt meets the room as it is now: a room that is gone,
+       a map this page cannot build, an outdated page and a ban are endings;
+       everything else is a race worth the next backoff step. */
+    if (NET.phase === 'connecting' && NET.rejoining) {
+      netResetTransport();
+      if (msg.code === 'room-not-found' || msg.code === 'unsupported-map' ||
+          msg.code === 'version' || msg.code === 'banned') {
+        netEndSession(errorText);
+      } else {
+        netScheduleRejoin();
+      }
+      return;
+    }
     if (NET.phase === 'connecting') {
       const plan = NET.quick;
       /* Only a join can be retried elsewhere. A create that fails failed for a
@@ -1543,6 +1701,9 @@ function netBeginMatch() {
    the socket is what leaves the room — the relay frees the seat on the close,
    which is why this must not be reached by tearing the match down alone. */
 function netLeaveMatch(reason) {
+  /* Chosen, not suffered: no rejoin follows the player out the door. */
+  NET.session = null;
+  NET.rejoining = false;
   netResetTransport();
   returnToMenu(reason);
   if (!reason) netStatus('');
@@ -1873,6 +2034,8 @@ function netFinishSeamlessMigration() {
 }
 
 function netEndSession(message) {
+  NET.session = null;
+  NET.rejoining = false;
   netResetTransport();
   returnToMenu(message);
 }

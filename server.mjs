@@ -849,6 +849,15 @@ export function createRelayServer(options = {}) {
      fires 'close' and updates the pair state. Pings are still sent as
      harmless NAT/proxy keepalives, but never used to judge liveness. */
   const gyroSilenceMs = positiveInteger(options.gyroSilenceMs, 20_000);
+  /* App-level liveness for the room channel, the same proof the gyro channel
+     already had: the edge proxy answers protocol pings for a client that is
+     long gone, so a pong only proves the proxy path is up. Any room message
+     counts as life; a peer with nothing to say sends hb and gets hbok back.
+     A heartbeating page silent past roomSilenceMs is terminated so a dead
+     seat frees itself for the page's own rejoin rather than holding a duel
+     chair for a ghost; a page that never heartbeats is from before this
+     clock and is left exactly as alone as it always was. */
+  const roomSilenceMs = positiveInteger(options.roomSilenceMs, 25_000);
   const gyroHeartbeat = setInterval(() => {
     const nowMs = Date.now();
     for (const pair of gyroPairs.values()) {
@@ -1223,6 +1232,16 @@ export function createRelayServer(options = {}) {
     });
   }
 
+  /* A page-generated, per-tab random id that lets one browser reclaim its
+     own seat after its socket dies behind the proxy. Not an identity: it
+     only ever matches a peer that presented the same id from the same room
+     code, and it is never shown to or accepted from another player. */
+  function cleanResumeId(value) {
+    if (typeof value !== 'string') return null;
+    const id = value.trim();
+    return /^[A-Za-z0-9_-]{8,80}$/.test(id) ? id : null;
+  }
+
   function handleCreate(peer, message) {
     const name = Protocol.cleanPlayerName(message.name);
     if (!name) {
@@ -1240,6 +1259,7 @@ export function createRelayServer(options = {}) {
     }
     const identity = approvedIdentity(message);
     if (rejectBannedIdentity(peer, name, identity)) return;
+    peer.resumeId = cleanResumeId(message.resume);
     if (rooms.size >= maxRooms) {
       sendError(peer, 'server-full', 'The room server is full.');
       return;
@@ -1318,7 +1338,47 @@ export function createRelayServer(options = {}) {
       sendError(peer, 'room-migrating', 'That room is changing host. Try again in a moment.');
       return;
     }
-    if (room.rules === 'duel' && room.started) {
+    peer.resumeId = cleanResumeId(message.resume);
+    let reclaimed = false;
+    if (peer.resumeId) {
+      let stale = null;
+      for (const member of room.members.values()) {
+        if (member.resumeId === peer.resumeId) { stale = member; break; }
+      }
+      if (stale) {
+        /* The page this resume belongs to is back on a fresh socket; the old
+           one is a ghost the proxy has not let go of yet. Reclaiming the seat
+           now beats waiting out the silence clock, and the departure walks
+           the same path a dropped connection would have. */
+        try { stale.ws.close(1000, 'session replaced'); }
+        catch (error) { try { stale.ws.terminate(); } catch (ignored) {} }
+        /* Its close event fires later; the departure is already done. */
+        stale.cleanedUp = true;
+        if (stale.joinTimer) clearTimeout(stale.joinTimer);
+        peers.delete(stale.ws);
+        leaveRoom(stale);
+        reclaimed = true;
+        /* Reclaiming the last seat dissolves the room itself: there is no
+           room to come back to when nobody else is in it. */
+        if (rooms.get(code) !== room) {
+          sendError(peer, 'room-not-found', 'That room does not exist.');
+          return;
+        }
+        /* Reclaiming the host's own seat mid-round moves authority first;
+           the rejoin walks in once that settles. */
+        if (room.migrating) {
+          sendError(peer, 'room-migrating', 'That room is changing host. Try again in a moment.');
+          return;
+        }
+      }
+    }
+    /* A running 1v1 refuses arrivals only while both chairs are taken. A
+       chair standing empty — its player dropped and the close already
+       landed — is fillable: that is how the dropped player's own rejoin
+       gets back in, and a stranger filling it faces the same round the
+       chair's old owner left. */
+    if (room.rules === 'duel' && room.started && !reclaimed &&
+        room.members.size >= 2) {
       sendError(peer, 'room-full', 'This 1v1 round is running. Wait for the next pair.');
       return;
     }
@@ -2016,6 +2076,15 @@ export function createRelayServer(options = {}) {
     }
 
     const message = parsed.value;
+    peer.lastMsgAt = Date.now();
+    /* Liveness proof, answered before the version gate on purpose: an
+       out-of-date page is still a live one, and its silence clock should say
+       so. hb carries no state and answers with a fixed frame. */
+    if (message.t === 'hb') {
+      peer.sentHb = true;
+      try { peer.ws.send('{"t":"hbok"}'); } catch (error) {}
+      return;
+    }
     const messageShape = inspectMessageShape(message);
     if (messageShape === MESSAGE_SHAPE_INVALID) {
       sendError(peer, 'invalid-shape', 'Message nesting or collection size is invalid.');
@@ -2340,6 +2409,12 @@ export function createRelayServer(options = {}) {
       lastSeq: -1,
       alive: true,
       cleanedUp: false,
+      lastMsgAt: Date.now(),
+      resumeId: null,
+      /* Set by the first hb: pages new enough to heartbeat opt into the
+         silence cull, and pages from before it keep the old behavior of
+         sitting quietly in a lobby as long as they like. */
+      sentHb: false,
       moderated: false,
       rateTokens: rateBurst,
       rateUpdatedAt: Date.now(),
@@ -2451,6 +2526,18 @@ export function createRelayServer(options = {}) {
 
   const idleSweep = idleKickMs > 0 ? setInterval(sweepIdlePeers, idleSweepMs) : null;
   if (idleSweep && typeof idleSweep.unref === 'function') idleSweep.unref();
+
+  const roomSilence = roomSilenceMs > 0
+    ? setInterval(() => {
+      const now = Date.now();
+      for (const peer of peers.values()) {
+        if (!peer.room || peer.cleanedUp || !peer.sentHb) continue;
+        if (now - peer.lastMsgAt <= roomSilenceMs) continue;
+        try { peer.ws.terminate(); } catch (error) {}
+      }
+    }, Math.max(1_000, Math.floor(roomSilenceMs / 4)))
+    : null;
+  if (roomSilence && typeof roomSilence.unref === 'function') roomSilence.unref();
 
   const heartbeat = heartbeatMs > 0
     ? setInterval(() => {
