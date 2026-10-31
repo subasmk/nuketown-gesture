@@ -119,7 +119,7 @@ test('android app wiring: POINT/TILT toggle, re-centre, foreground service with 
   assert.match(act, /KEYCODE_VOLUME_DOWN/);
 });
 
-test('android app wiring: no gun picker on the phone, sensitivity on both screens, version 4', async () => {
+test('android app wiring: no gun picker on the phone, sensitivity on both screens', async () => {
   const fs = await import('node:fs');
   const dir = new URL('./android-controller/app/', import.meta.url);
   const svc = fs.readFileSync(new URL('src/main/java/com/subasmk/nuketown/ControllerService.java', dir), 'utf8');
@@ -141,6 +141,6 @@ test('android app wiring: no gun picker on the phone, sensitivity on both screen
   assert.match(act, /AIM SENSITIVITY/);
   assert.match(svc, /setSens/);
   assert.match(svc, /sens \/ 13f/);
-  assert.match(gradle, /versionCode 4/);
-  assert.match(gradle, /versionName '4\.0'/);
+  assert.match(gradle, /versionCode 7/);
+  assert.match(gradle, /versionName '4.3'/);
 });

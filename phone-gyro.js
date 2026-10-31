@@ -165,7 +165,13 @@ addEventListener('DOMContentLoaded', () => {
   const phoneSyncMount = () => {
     const title = document.getElementById('title');
     const menu = document.getElementById('menu');
-    const paused = !!(title && title.classList.contains('hud') && menu);
+    /* #title carries `hud` only while the SETUP menu is on screen; the pause
+       card is that same #menu with class `pause` and no `hud` on #title
+       (menuHudSyncLayout in the game toggles it). Watching `hud` here would
+       mount the panel on the main menu and hide it in pause - backwards. */
+    const paused = !!(title && menu && !menu.hidden
+      && menu.classList.contains('pause')
+      && !title.classList.contains('off'));
     if (paused) {
       if (box.parentNode !== menu) menu.appendChild(box);
       box.style.position = 'static'; box.style.width = '100%';
@@ -176,9 +182,12 @@ addEventListener('DOMContentLoaded', () => {
       box.style.marginTop = ''; box.style.display = '';
     }
   };
-  const titleEl = document.getElementById('title');
-  if (titleEl && typeof MutationObserver === 'function') {
-    try { new MutationObserver(phoneSyncMount).observe(titleEl, { attributes: true, attributeFilter: ['class'] }); } catch (e) {}
+  if (typeof MutationObserver === 'function') {
+    const mountObs = new MutationObserver(phoneSyncMount);
+    const titleEl = document.getElementById('title');
+    const menuEl = document.getElementById('menu');
+    if (titleEl) { try { mountObs.observe(titleEl, { attributes: true, attributeFilter: ['class'] }); } catch (e) {} }
+    if (menuEl) { try { mountObs.observe(menuEl, { attributes: true, attributeFilter: ['class', 'hidden'] }); } catch (e) {} }
   }
   phoneSyncMount();
   /* A page reload (deploy, refresh, crash) used to silently drop the laptop
